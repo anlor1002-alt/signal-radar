@@ -1,0 +1,6 @@
+python-telegram-bot==22.7
+pytrends==4.9.2
+pandas==2.3.3
+numpy
+python-dotenv==1.2.2
+urllib3<2
