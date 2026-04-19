@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import html
 import os
+from datetime import datetime
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -34,6 +35,15 @@ from signal_radar import (
     fetch_trend_signals,
     get_recommendation,
     velocity_engine,
+)
+from database import (
+    add_keyword,
+    get_all_tracked_keywords,
+    get_user_keywords,
+    init_db,
+    register_user,
+    remove_keyword,
+    update_keyword_status,
 )
 
 load_dotenv()
@@ -307,15 +317,199 @@ async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 
 # ---------------------------------------------------------------------------
+# Tracking Commands: /track, /untrack, /mylist
+# ---------------------------------------------------------------------------
+
+async def cmd_track(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add a keyword to the user's tracking list."""
+    await register_user(update.effective_user.id)
+
+    if not context.args:
+        await update.message.reply_text(
+            "Dùng: <code>/track từ khóa</code>\nVí dụ: <code>/track mật ong</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    keyword = " ".join(context.args).strip()
+    if not keyword:
+        return
+
+    from signal_radar import detect_domain
+    domain = detect_domain(keyword)
+    added = await add_keyword(update.effective_user.id, keyword, domain)
+
+    if added:
+        de = DOMAIN_EMOJI.get(domain, "\U0001F310")
+        await update.message.reply_text(
+            f"\u2705 Đã theo dõi: <b>{html.escape(keyword)}</b> {de} {domain}\n"
+            "Bot sẽ tự động quét hàng ngày và báo khi có thay đổi trạng thái.",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await update.message.reply_text(
+            f"Bạn đã theo dõi <b>{html.escape(keyword)}</b> rồi.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def cmd_untrack(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove a keyword from the user's tracking list."""
+    if not context.args:
+        await update.message.reply_text(
+            "Dùng: <code>/untrack từ khóa</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    keyword = " ".join(context.args).strip()
+    removed = await remove_keyword(update.effective_user.id, keyword)
+
+    if removed:
+        await update.message.reply_text(
+            f"\u274C Đã bỏ theo dõi: <b>{html.escape(keyword)}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await update.message.reply_text(
+            f"Không tìm thấy <b>{html.escape(keyword)}</b> trong danh sách.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def cmd_mylist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show all keywords the user is currently tracking."""
+    keywords = await get_user_keywords(update.effective_user.id)
+
+    if not keywords:
+        await update.message.reply_text(
+            "Danh sách trống. Dùng /track để thêm từ khóa.",
+        )
+        return
+
+    lines = ["<b>Danh sách theo dõi</b>\n"]
+    for kw in keywords:
+        status = kw["last_status"] or "NEW"
+        domain = kw["domain"] or "General"
+        emoji = STATUS_EMOJI.get(status, "\u2753")
+        de = DOMAIN_EMOJI.get(domain, "\U0001F310")
+        wow = kw["last_wow_growth"]
+        wow_str = f"{wow:+.1f}%" if wow and wow != 0 else "—"
+        conf = kw["last_confidence"] or 0
+
+        lines.append(
+            f"{emoji} {de} {html.escape(kw['keyword'])}\n"
+            f"  Status: {status} | WoW: {wow_str} | Conf: {conf}/100"
+        )
+
+    await update.message.reply_text("\n\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+# ---------------------------------------------------------------------------
+# Background Silent Tracker (runs daily at 00:00)
+# ---------------------------------------------------------------------------
+
+ALERT_TRANSITIONS = {
+    ("STABLE", "BURSTING"), ("RISING", "BURSTING"),
+    ("STABLE", "EMERGING"), ("RISING", "EMERGING"),
+    ("UNKNOWN", "BURSTING"), ("UNKNOWN", "EMERGING"),
+}
+
+
+async def _daily_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Background job: scan all tracked keywords and push alerts on transitions."""
+    print("[TRACKER] Daily scan starting...")
+    all_keywords = await get_all_tracked_keywords()
+
+    if not all_keywords:
+        print("[TRACKER] No tracked keywords — skipping.")
+        return
+
+    # Group by unique keyword to avoid duplicate API calls
+    unique_keywords = list({kw["keyword"] for kw in all_keywords})
+    config = TrendSignalConfig()
+
+    interest_df = await asyncio.to_thread(fetch_trend_signals, unique_keywords, config)
+    if interest_df.empty:
+        print("[TRACKER] No data fetched — skipping.")
+        return
+
+    results = await asyncio.to_thread(velocity_engine, interest_df)
+
+    if results.empty:
+        print("[TRACKER] Velocity engine returned empty — skipping.")
+        return
+
+    # Build lookup: keyword → result row
+    result_map = {str(row["keyword"]): row for _, row in results.iterrows()}
+
+    for tracked in all_keywords:
+        row = result_map.get(tracked["keyword"])
+        if row is None:
+            continue
+
+        new_status = str(row["status"])
+        old_status = tracked["last_status"] or "UNKNOWN"
+        wow = float(row["wow_growth_pct"]) if row["wow_growth_pct"] != float("inf") else 999.0
+        conf = int(row["confidence"])
+        domain = str(row.get("domain", tracked["domain"] or "General"))
+
+        # Check for status transition
+        if (old_status, new_status) in ALERT_TRANSITIONS:
+            emoji = STATUS_EMOJI.get(new_status, "\U0001F6A8")
+            de = DOMAIN_EMOJI.get(domain, "\U0001F310")
+            rec = get_recommendation(domain, new_status)
+
+            message = (
+                f"<b>{emoji} CẬP NHẬT THEO DÕI {emoji}</b>\n\n"
+                f"<b>{html.escape(tracked['keyword'])}</b> {de} {domain}\n"
+                f"Trạng thái: {old_status} → <b>{new_status}</b>\n"
+                f"Wow: +{wow:.1f}% | Confidence: {conf}/100\n"
+                f"→ <b>{rec}</b>"
+            )
+
+            try:
+                await context.bot.send_message(
+                    chat_id=tracked["chat_id"],
+                    text=message,
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as exc:
+                print(f"[TRACKER] Failed to notify {tracked['chat_id']}: {exc}")
+
+        # Update DB regardless of transition
+        await update_keyword_status(
+            keyword_id=tracked["id"],
+            status=new_status,
+            wow_growth=wow,
+            confidence=conf,
+            domain=domain,
+        )
+
+    print(f"[TRACKER] Scan complete — {len(all_keywords)} keywords processed.")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+async def _post_init(application) -> None:
+    """Run after Application is built — init database."""
+    await init_db()
+    print("[BOT] Database initialised.")
+
 
 def main() -> None:
     if not BOT_TOKEN:
         print("[ERROR] TELEGRAM_BOT_TOKEN not set. Check .env file.")
         return
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(_post_init)
+        .build()
+    )
 
     # Conversation for /scan flow
     scan_conversation = ConversationHandler(
@@ -329,6 +523,9 @@ def main() -> None:
     application.add_handler(scan_conversation)
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
+    application.add_handler(CommandHandler("track", cmd_track))
+    application.add_handler(CommandHandler("untrack", cmd_untrack))
+    application.add_handler(CommandHandler("mylist", cmd_mylist))
     application.add_handler(CallbackQueryHandler(button_callback))
 
     # Catch free-text when user clicked the inline button (not in /scan conversation)
@@ -336,7 +533,13 @@ def main() -> None:
         MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_text)
     )
 
-    print("Signal Radar bot is running... Press Ctrl+C to stop.")
+    # Background tracker — daily at 00:00
+    application.job_queue.run_daily(
+        _daily_scan,
+        time=datetime.strptime("00:00", "%H:%M").time(),
+    )
+
+    print("Signal Radar bot v3 is running... Press Ctrl+C to stop.")
     application.run_polling()
 
 

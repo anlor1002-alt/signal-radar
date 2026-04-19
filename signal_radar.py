@@ -46,6 +46,52 @@ MIN_ABSOLUTE_INTEREST = 20
 WOW_GROWTH_THRESHOLD = 3.0  # 300%
 
 
+# ---------------------------------------------------------------------------
+# Proxy Rotation Shield
+# ---------------------------------------------------------------------------
+
+class ProxyManager:
+    """Rotate HTTP proxies to dodge Google Trends rate limits."""
+
+    def __init__(self, proxy_list: list[str] | None = None):
+        self._proxies: list[str] = list(proxy_list) if proxy_list else []
+        self._failed: set[str] = set()
+
+    @property
+    def available(self) -> bool:
+        return len(self._proxies) > 0
+
+    def get_proxy(self) -> dict[str, str] | None:
+        """Return a random proxy dict for requests, or None."""
+        live = [p for p in self._proxies if p not in self._failed]
+        if not live:
+            # reset — give failed proxies another chance
+            self._failed.clear()
+            live = list(self._proxies)
+        if not live:
+            return None
+        proxy = random.choice(live)
+        return {"http": proxy, "https": proxy}
+
+    def mark_failed(self, proxy_dict: dict[str, str] | None) -> None:
+        """Mark a proxy as failed so it's skipped next round."""
+        if proxy_dict:
+            self._failed.add(proxy_dict.get("http", ""))
+
+    @classmethod
+    def from_env(cls) -> "ProxyManager":
+        """Load proxies from PROXY_LIST env var (comma-separated)."""
+        raw = os.getenv("PROXY_LIST", "").strip()
+        if not raw:
+            return cls()
+        proxies = [p.strip() for p in raw.split(",") if p.strip()]
+        return cls(proxies)
+
+
+# Singleton — loaded once at import time
+proxy_manager = ProxyManager.from_env()
+
+
 @dataclass(frozen=True)
 class TrendSignalConfig:
     """Runtime config for Google Trends ingestion."""
@@ -76,43 +122,48 @@ def fetch_trend_signals(
     """
     Fetch daily Google Trends interest for each keyword over the last N days.
 
-    The function requests each keyword separately so every keyword keeps its
-    own 0-100 normalization scale. A randomized sleep is added between calls
-    to reduce the chance of HTTP 429 rate limiting.
+    Uses proxy rotation + retry logic to handle HTTP 429 rate limits.
     """
     if not keywords:
         return pd.DataFrame()
 
     config = config or TrendSignalConfig()
     timeframe = _build_timeframe(config.timeframe_days)
-    pytrends = TrendReq(hl=config.hl, tz=config.tz, retries=2, backoff_factor=0.5)
 
     keyword_series: dict[str, pd.Series] = {}
 
     for index, keyword in enumerate(keywords):
         fetched = False
+        max_retries = 3
 
-        # --- Attempt 1: exact keyword ---
-        try:
-            pytrends.build_payload([keyword], timeframe=timeframe, geo=config.geo)
-            interest_df = pytrends.interest_over_time()
+        for attempt in range(max_retries):
+            # Pick a proxy (or None if no proxies configured)
+            proxies = proxy_manager.get_proxy()
 
-            if not interest_df.empty:
-                series = interest_df[keyword].copy()
-                series.name = keyword
-                keyword_series[keyword] = series
-                print(f"[OK] '{keyword}' — {len(series)} daily points.")
-                fetched = True
-        except Exception as exc:
-            print(f"[WARN] Attempt 1 failed for '{keyword}': {exc}")
-
-        # --- Attempt 2: auto-suggest from Google Trends ---
-        if not fetched:
             try:
+                pytrends = TrendReq(
+                    hl=config.hl, tz=config.tz,
+                    retries=2, backoff_factor=0.5,
+                    proxies=proxies,
+                )
+
+                # --- Attempt 1: exact keyword ---
+                pytrends.build_payload([keyword], timeframe=timeframe, geo=config.geo)
+                interest_df = pytrends.interest_over_time()
+
+                if not interest_df.empty:
+                    series = interest_df[keyword].copy()
+                    series.name = keyword
+                    keyword_series[keyword] = series
+                    print(f"[OK] '{keyword}' — {len(series)} daily points.")
+                    fetched = True
+                    break
+
+                # --- Attempt 2: auto-suggest ---
                 suggestions = pytrends.suggestions(keyword)
                 if suggestions:
                     alt = suggestions[0]["title"]
-                    print(f"[RETRY] '{keyword}' → trying suggestion: '{alt}'")
+                    print(f"[RETRY] '{keyword}' → suggestion: '{alt}'")
                     time.sleep(random.uniform(1.0, 2.5))
 
                     pytrends.build_payload([alt], timeframe=timeframe, geo=config.geo)
@@ -120,15 +171,24 @@ def fetch_trend_signals(
 
                     if not interest_df.empty:
                         series = interest_df[alt].copy()
-                        series.name = keyword  # keep original name for display
+                        series.name = keyword
                         keyword_series[keyword] = series
-                        print(f"[OK] '{keyword}' (via '{alt}') — {len(series)} daily points.")
+                        print(f"[OK] '{keyword}' (via '{alt}') — {len(series)} pts.")
                         fetched = True
+                        break
+
             except Exception as exc:
-                print(f"[WARN] Suggestion retry failed for '{keyword}': {exc}")
+                exc_str = str(exc)
+                if "429" in exc_str:
+                    print(f"[429] Rate limited on '{keyword}' (attempt {attempt + 1})")
+                    proxy_manager.mark_failed(proxies)
+                    time.sleep(random.uniform(5.0, 10.0))
+                    continue
+                print(f"[WARN] '{keyword}' attempt {attempt + 1}: {exc}")
+                break  # non-429 error, don't retry
 
         if not fetched:
-            print(f"[FAIL] No data for '{keyword}' — skipped.")
+            print(f"[FAIL] No data for '{keyword}' after {max_retries} attempts.")
 
         if index < len(keywords) - 1:
             sleep_seconds = random.uniform(

@@ -4,3 +4,5 @@ pandas==2.3.3
 numpy
 python-dotenv==1.2.2
 urllib3<2
+aiosqlite
+
