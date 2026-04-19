@@ -68,45 +68,39 @@ DOMAIN_EMOJI = {
 }
 
 
-def _format_results_message(results) -> str:
-    """Build a rich HTML-formatted report from velocity engine v2 results."""
-    if results.empty:
-        return "Không có đủ dữ liệu để phân tích. Thử từ khóa khác hoặc kiểm tra kết nối mạng."
+def _format_single_report(row) -> str:
+    """Build a per-keyword HTML report."""
+    kw = html.escape(str(row["keyword"]))
+    status = str(row["status"])
+    domain = str(row.get("domain", "General"))
+    emoji = STATUS_EMOJI.get(status, "\U0001F4CA")
+    domain_emoji = DOMAIN_EMOJI.get(domain, "\U0001F310")
+    wow = row["wow_growth_pct"]
+    wow_str = "INF" if wow == float("inf") else f"{wow:+.1f}"
+    conf = int(row["confidence"])
+    consistency = int(row["consistency_pct"])
+    peak = int(row["peak_position_pct"])
+    accel = row["acceleration_pct"]
+    accel_str = f"{accel:+.1f}%"
+    interest = int(round(float(row["interest"])))
 
-    lines = ["<b>SIGNAL RADAR — Báo cáo phân tích</b>\n"]
+    rec = get_recommendation(domain, status)
 
-    # --- Per-keyword detail ---
-    for _, row in results.iterrows():
-        kw = html.escape(str(row["keyword"]))
-        status = str(row["status"])
-        domain = str(row.get("domain", "General"))
-        emoji = STATUS_EMOJI.get(status, "\U0001F4CA")
-        domain_emoji = DOMAIN_EMOJI.get(domain, "\U0001F310")
-        wow = row["wow_growth_pct"]
-        wow_str = "INF" if wow == float("inf") else f"{wow:.1f}"
-        conf = int(row["confidence"])
-        consistency = int(row["consistency_pct"])
-        peak = int(row["peak_position_pct"])
-        accel = row["acceleration_pct"]
-        accel_str = f"{accel:+.1f}%"
-        interest = int(round(float(row["interest"])))
+    filled = conf // 10
+    bar = "\u2588" * filled + "\u2591" * (10 - filled)
 
-        # Domain-specific recommendation
-        rec = get_recommendation(domain, status)
+    return (
+        f"<b>SIGNAL RADAR</b>\n\n"
+        f"{emoji} <b>{kw}</b> {domain_emoji} {domain}\n"
+        f"  Interest: {interest} | WoW: {wow_str}%\n"
+        f"  Gia tốc: {accel_str} | Bền vững: {consistency}%\n"
+        f"  Đỉnh 30d: {peak}% | Confidence: {bar} {conf}/100\n"
+        f"  → <b>{rec}</b>"
+    )
 
-        # Confidence bar
-        filled = conf // 10
-        bar = "\u2588" * filled + "\u2591" * (10 - filled)
 
-        lines.append(
-            f"{emoji} <b>{kw}</b> {domain_emoji} {domain}\n"
-            f"  Interest: {interest} | WoW: +{wow_str}%\n"
-            f"  Gia tốc: {accel_str} | Bền vững: {consistency}%\n"
-            f"  Đỉnh 30d: {peak}% | Confidence: {bar} {conf}/100\n"
-            f"  → <b>{rec}</b>"
-        )
-
-    # --- Summary block ---
+def _format_summary(results) -> str:
+    """Build the summary message after all per-keyword reports."""
     total = len(results)
     status_counts = results["status"].value_counts().to_dict()
     bursting = status_counts.get("BURSTING", 0)
@@ -115,14 +109,12 @@ def _format_results_message(results) -> str:
     stable = status_counts.get("STABLE", 0)
     declining = status_counts.get("DECLINING", 0)
 
-    # Domain breakdown
     domain_counts = results["domain"].value_counts().to_dict() if "domain" in results.columns else {}
     domain_lines = []
     for d, count in domain_counts.items():
         de = DOMAIN_EMOJI.get(d, "\U0001F310")
         domain_lines.append(f"  {de} {d}: {count}")
 
-    # Top 3 by confidence
     top3 = results.nlargest(3, "confidence")[["keyword", "confidence", "status", "domain"]]
     top_lines = []
     for _, r in top3.iterrows():
@@ -132,7 +124,6 @@ def _format_results_message(results) -> str:
             f"  {e} {de} {html.escape(str(r['keyword']))} ({int(r['confidence'])}/100)"
         )
 
-    # Overall recommendation
     if bursting > 0:
         rec = "\U0001F6A8 Xu hướng bùng nổ phát hiện — hành động ngay!"
     elif emerging > 0:
@@ -142,17 +133,14 @@ def _format_results_message(results) -> str:
     else:
         rec = "\U0001F4CA Thị trường ổn định — chưa có tín hiệu mạnh."
 
-    lines.append(
-        f"\n<b>TỔNG KẾT</b>\n"
-        f"Quét: {total} từ khóa\n"
+    return (
+        f"<b>TỔNG KẾT — {total} từ khóa</b>\n\n"
         f"\U0001F6A8 Bursting: {bursting} | \U0001F525 Emerging: {emerging} | "
         f"\U0001F4C8 Rising: {rising}\n"
         f"\U0001F4CA Stable: {stable} | \U0001F4C9 Declining: {declining}\n\n"
         f"<b>Lĩnh vực:</b>\n" + "\n".join(domain_lines) +
         f"\n\n<b>Top tiềm năng:</b>\n" + "\n".join(top_lines) + f"\n\n{rec}"
     )
-
-    return "\n\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -251,26 +239,21 @@ async def handle_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return ConversationHandler.END
 
     results = await asyncio.to_thread(velocity_engine, interest_df, domain_override)
-    reply = _format_results_message(results)
 
-    # Telegram message limit is 4096 chars — split if needed
-    if len(reply) <= 4096:
-        await processing_msg.edit_text(reply, parse_mode=ParseMode.HTML)
-    else:
-        await processing_msg.edit_text("Phân tích xong! Kết quả chi tiết:")
-        # Split into chunks of ~4000 chars on double-newline boundaries
-        chunks, current = [], ""
-        for paragraph in reply.split("\n\n"):
-            if len(current) + len(paragraph) + 2 > 4000:
-                chunks.append(current)
-                current = paragraph
-            else:
-                current = current + "\n\n" + paragraph if current else paragraph
-        if current:
-            chunks.append(current)
+    if results.empty:
+        await processing_msg.edit_text("Không đủ dữ liệu để phân tích.")
+        return ConversationHandler.END
 
-        for chunk in chunks:
-            await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
+    # Send individual report per keyword
+    await processing_msg.edit_text(f"Phân tích xong {len(results)} từ khóa!")
+    for _, row in results.iterrows():
+        report = _format_single_report(row)
+        await update.message.reply_text(report, parse_mode=ParseMode.HTML)
+        await asyncio.sleep(0.3)
+
+    # Send summary
+    summary = _format_summary(results)
+    await update.message.reply_text(summary, parse_mode=ParseMode.HTML)
 
     return ConversationHandler.END
 
