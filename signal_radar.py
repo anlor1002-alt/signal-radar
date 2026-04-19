@@ -248,7 +248,10 @@ def velocity_engine(interest_df: pd.DataFrame) -> pd.DataFrame:
         if len(ma7.dropna()) >= 21:
             prev_prev_week = float(ma7.iloc[-21:-14].mean())
             prev_wow = _wow_growth(previous_week, prev_prev_week)
-            accel = wow - prev_wow
+            # Cap inf values to avoid -inf when subtracting
+            wow_capped = 10.0 if wow == float("inf") else wow   # 1000% cap
+            prev_wow_capped = 10.0 if prev_wow == float("inf") else prev_wow
+            accel = wow_capped - prev_wow_capped
         else:
             accel = 0.0
 
