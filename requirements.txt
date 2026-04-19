@@ -1,4 +1,4 @@
-python-telegram-bot==22.7
+python-telegram-bot[job-queue]==22.7
 pytrends==4.9.2
 pandas==2.3.3
 numpy
