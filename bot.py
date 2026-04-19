@@ -39,8 +39,10 @@ from signal_radar import (
 from database import (
     add_keyword,
     get_all_tracked_keywords,
+    get_keyword_history,
     get_user_keywords,
     init_db,
+    insert_scan_history,
     register_user,
     remove_keyword,
     update_keyword_status,
@@ -194,12 +196,15 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show usage instructions."""
     await update.message.reply_text(
         "<b>Hướng dẫn sử dụng</b>\n\n"
-        "/scan — Bắt đầu quét từ khóa\n"
-        "  Bot sẽ hỏi bạn nhập từ khóa.\n"
-        "  Nhập mỗi từ khóa cách nhau bằng dấu phẩy.\n"
-        "  Ví dụ: <i>mật ong, tinh bột nghệ, đường ăn kiêng</i>\n\n"
-        "/start — Về menu chính\n"
-        "/help — Xem hướng dẫn này",
+        "/start — Menu chính (chọn lĩnh vực)\n"
+        "/scan — Quét nhanh từ khóa\n"
+        "/track &lt;kw&gt; — Theo dõi từ khóa (quét tự động hàng ngày)\n"
+        "/untrack &lt;kw&gt; — Bỏ theo dõi\n"
+        "/mylist — Xem danh sách theo dõi (sắp xếp theo mức quan trọng)\n"
+        "/history &lt;kw&gt; — Xem lịch sử quét 7 ngày gần nhất\n"
+        "/help — Xem hướng dẫn này\n\n"
+        "Bot tự động quét từ khóa đã /track mỗi ngày\n"
+        "và gửi báo cáo tổng hợp (digest) cho bạn.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -298,7 +303,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "1. Nhấn /start → chọn lĩnh vực\n"
             "2. Nhập từ khóa (cách nhau dấu phẩy)\n"
             "3. Bot phân tích và trả kết quả\n\n"
-            "Hoặc dùng /scan để quét nhanh (tự detect lĩnh vực).\n\n"
+            "/track &lt;kw&gt; — Theo dõi tự động hàng ngày\n"
+            "/history &lt;kw&gt; — Xem lịch sử 7 ngày\n"
+            "/mylist — Danh sách theo dõi\n"
             "/start — Menu chính\n"
             "/help — Xem hướng dẫn này",
             parse_mode=ParseMode.HTML,
@@ -378,7 +385,7 @@ async def cmd_untrack(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def cmd_mylist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show all keywords the user is currently tracking."""
+    """Show all tracked keywords sorted by importance."""
     keywords = await get_user_keywords(update.effective_user.id)
 
     if not keywords:
@@ -387,7 +394,14 @@ async def cmd_mylist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
-    lines = ["<b>Danh sách theo dõi</b>\n"]
+    # Sort by importance: BURSTING first, then by confidence descending
+    status_priority = {"BURSTING": 0, "EMERGING": 1, "RISING": 2, "STABLE": 3, "DECLINING": 4, "UNKNOWN": 5, "NEW": 5}
+    keywords.sort(key=lambda kw: (
+        status_priority.get(kw.get("last_status") or "NEW", 5),
+        -(kw.get("last_confidence") or 0),
+    ))
+
+    lines = [f"<b>Danh sách theo dõi ({len(keywords)})</b>\n"]
     for kw in keywords:
         status = kw["last_status"] or "NEW"
         domain = kw["domain"] or "General"
@@ -398,26 +412,88 @@ async def cmd_mylist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         conf = kw["last_confidence"] or 0
 
         lines.append(
-            f"{emoji} {de} {html.escape(kw['keyword'])}\n"
-            f"  Status: {status} | WoW: {wow_str} | Conf: {conf}/100"
+            f"{emoji} {de} <b>{html.escape(kw['keyword'])}</b>\n"
+            f"  {status} | WoW: {wow_str} | Conf: {conf}/100"
         )
 
-    await update.message.reply_text("\n\n".join(lines), parse_mode=ParseMode.HTML)
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+# ---------------------------------------------------------------------------
+# /history command
+# ---------------------------------------------------------------------------
+
+# Sparkline characters from low to high
+_SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
+
+def _sparkline(values: list[float]) -> str:
+    """Generate a Unicode sparkline from a list of numeric values."""
+    if not values or max(values) == min(values):
+        return _SPARK_CHARS[0] * len(values)
+    lo, hi = min(values), max(values)
+    scale = len(_SPARK_CHARS) - 1
+    return "".join(
+        _SPARK_CHARS[min(int((v - lo) / (hi - lo) * scale), scale)]
+        for v in values
+    )
+
+
+async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show recent scan history for a tracked keyword."""
+    if not context.args:
+        await update.message.reply_text(
+            "Dùng: <code>/history từ khóa</code>\nVí dụ: <code>/history mật ong</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    keyword = " ".join(context.args).strip()
+    rows = await get_keyword_history(update.effective_user.id, keyword, limit=7)
+
+    if not rows:
+        await update.message.reply_text(
+            f"Chưa có lịch sử cho <b>{html.escape(keyword)}</b>.\n"
+            "Dùng /track để theo dõi từ khóa này trước.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    kw_escaped = html.escape(keyword)
+    lines = [f"<b>Lịch sử — {kw_escaped}</b> (7 ngày gần nhất)\n"]
+
+    # Build sparkline from interest values (reversed to chronological)
+    interests = [r["interest"] for r in reversed(rows)]
+    spark = _sparkline(interests)
+
+    for r in rows:
+        status = r["status"]
+        emoji = STATUS_EMOJI.get(status, "\U0001F4CA")
+        wow = r["wow_growth"]
+        wow_str = f"{wow:+.1f}%" if wow else "—"
+        conf = r["confidence"]
+        interest = int(r["interest"])
+        date_str = r["scanned_at"][:10]  # YYYY-MM-DD
+
+        lines.append(
+            f"{emoji} {date_str} | {status} | WoW: {wow_str} | "
+            f"Int: {interest} | Conf: {conf}"
+        )
+
+    lines.append(f"\nInterest trend: <code>{spark}</code>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 # ---------------------------------------------------------------------------
 # Background Silent Tracker (runs daily at 00:00)
 # ---------------------------------------------------------------------------
 
-ALERT_TRANSITIONS = {
-    ("STABLE", "BURSTING"), ("RISING", "BURSTING"),
-    ("STABLE", "EMERGING"), ("RISING", "EMERGING"),
-    ("UNKNOWN", "BURSTING"), ("UNKNOWN", "EMERGING"),
-}
+_BURSTING_IMMEDIATE = {"BURSTING"}
 
 
 async def _daily_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Background job: scan all tracked keywords and push alerts on transitions."""
+    """Background job: scan tracked keywords, save history, push digest + alerts."""
     print("[TRACKER] Daily scan starting...")
     all_keywords = await get_all_tracked_keywords()
 
@@ -425,7 +501,6 @@ async def _daily_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
         print("[TRACKER] No tracked keywords — skipping.")
         return
 
-    # Group by unique keyword to avoid duplicate API calls
     unique_keywords = list({kw["keyword"] for kw in all_keywords})
     config = TrendSignalConfig()
 
@@ -435,49 +510,40 @@ async def _daily_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     results = await asyncio.to_thread(velocity_engine, interest_df)
-
     if results.empty:
         print("[TRACKER] Velocity engine returned empty — skipping.")
         return
 
-    # Build lookup: keyword → result row
     result_map = {str(row["keyword"]): row for _, row in results.iterrows()}
 
+    # ---- Phase 1: Save history + update tracked_keywords ----
     for tracked in all_keywords:
         row = result_map.get(tracked["keyword"])
         if row is None:
             continue
 
         new_status = str(row["status"])
-        old_status = tracked["last_status"] or "UNKNOWN"
         wow = float(row["wow_growth_pct"]) if row["wow_growth_pct"] != float("inf") else 999.0
         conf = int(row["confidence"])
         domain = str(row.get("domain", tracked["domain"] or "General"))
+        interest = float(row["interest"])
+        accel = float(row["acceleration_pct"])
+        consistency = float(row["consistency_pct"])
+        peak = float(row["peak_position_pct"])
 
-        # Check for status transition
-        if (old_status, new_status) in ALERT_TRANSITIONS:
-            emoji = STATUS_EMOJI.get(new_status, "\U0001F6A8")
-            de = DOMAIN_EMOJI.get(domain, "\U0001F310")
-            rec = get_recommendation(domain, new_status)
+        await insert_scan_history(
+            keyword=tracked["keyword"],
+            chat_id=tracked["chat_id"],
+            domain=domain,
+            status=new_status,
+            wow_growth=wow,
+            confidence=conf,
+            interest=interest,
+            acceleration=accel,
+            consistency=consistency,
+            peak_position=peak,
+        )
 
-            message = (
-                f"<b>{emoji} CẬP NHẬT THEO DÕI {emoji}</b>\n\n"
-                f"<b>{html.escape(tracked['keyword'])}</b> {de} {domain}\n"
-                f"Trạng thái: {old_status} → <b>{new_status}</b>\n"
-                f"Wow: +{wow:.1f}% | Confidence: {conf}/100\n"
-                f"→ <b>{rec}</b>"
-            )
-
-            try:
-                await context.bot.send_message(
-                    chat_id=tracked["chat_id"],
-                    text=message,
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception as exc:
-                print(f"[TRACKER] Failed to notify {tracked['chat_id']}: {exc}")
-
-        # Update DB regardless of transition
         await update_keyword_status(
             keyword_id=tracked["id"],
             status=new_status,
@@ -485,6 +551,86 @@ async def _daily_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
             confidence=conf,
             domain=domain,
         )
+
+    # ---- Phase 2: Immediate BURSTING alerts ----
+    for tracked in all_keywords:
+        row = result_map.get(tracked["keyword"])
+        if row is None:
+            continue
+
+        new_status = str(row["status"])
+        old_status = tracked["last_status"] or "UNKNOWN"
+        if new_status not in _BURSTING_IMMEDIATE or old_status == new_status:
+            continue
+
+        domain = str(row.get("domain", tracked["domain"] or "General"))
+        conf = int(row["confidence"])
+        wow = float(row["wow_growth_pct"]) if row["wow_growth_pct"] != float("inf") else 999.0
+        de = DOMAIN_EMOJI.get(domain, "\U0001F310")
+        rec = get_recommendation(domain, new_status)
+
+        message = (
+            f"<b>\U0001F6A8 BURSTING ALERT \U0001F6A8</b>\n\n"
+            f"<b>{html.escape(tracked['keyword'])}</b> {de} {domain}\n"
+            f"Trạng thái: {old_status} → <b>{new_status}</b>\n"
+            f"Wow: +{wow:.1f}% | Confidence: {conf}/100\n"
+            f"→ <b>{rec}</b>"
+        )
+
+        try:
+            await context.bot.send_message(
+                chat_id=tracked["chat_id"],
+                text=message,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as exc:
+            print(f"[TRACKER] Failed to alert {tracked['chat_id']}: {exc}")
+
+    # ---- Phase 3: Per-user daily digest ----
+    user_chat_ids = list({kw["chat_id"] for kw in all_keywords})
+    status_order = {"BURSTING": 0, "EMERGING": 1, "RISING": 2, "STABLE": 3, "DECLINING": 4}
+
+    for chat_id in user_chat_ids:
+        user_rows = []
+        for tracked in all_keywords:
+            if tracked["chat_id"] != chat_id:
+                continue
+            row = result_map.get(tracked["keyword"])
+            if row is not None:
+                user_rows.append(row)
+
+        if not user_rows:
+            continue
+
+        user_rows.sort(
+            key=lambda r: (status_order.get(str(r["status"]), 5), -int(r["confidence"]))
+        )
+
+        lines = ["<b>BÁO CÁO HÀNG NGÀY</b>\n"]
+        for row in user_rows:
+            status = str(row["status"])
+            domain = str(row.get("domain", "General"))
+            emoji = STATUS_EMOJI.get(status, "\U0001F4CA")
+            de = DOMAIN_EMOJI.get(domain, "\U0001F310")
+            kw = html.escape(str(row["keyword"]))
+            wow = row["wow_growth_pct"]
+            wow_str = "INF" if wow == float("inf") else f"{wow:+.1f}"
+            conf = int(row["confidence"])
+            interest = int(round(float(row["interest"])))
+
+            lines.append(
+                f"{emoji} {de} <b>{kw}</b>\n"
+                f"  {status} | Int: {interest} | WoW: {wow_str}% | Conf: {conf}"
+            )
+
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="\n".join(lines),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as exc:
+            print(f"[TRACKER] Failed to send digest to {chat_id}: {exc}")
 
     print(f"[TRACKER] Scan complete — {len(all_keywords)} keywords processed.")
 
@@ -526,6 +672,7 @@ def main() -> None:
     application.add_handler(CommandHandler("track", cmd_track))
     application.add_handler(CommandHandler("untrack", cmd_untrack))
     application.add_handler(CommandHandler("mylist", cmd_mylist))
+    application.add_handler(CommandHandler("history", cmd_history))
     application.add_handler(CallbackQueryHandler(button_callback))
 
     # Catch free-text when user clicked the inline button (not in /scan conversation)

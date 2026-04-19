@@ -32,6 +32,27 @@ CREATE TABLE IF NOT EXISTS tracked_keywords (
     FOREIGN KEY (chat_id) REFERENCES users(chat_id),
     UNIQUE(chat_id, keyword)
 );
+
+CREATE TABLE IF NOT EXISTS scan_history (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    keyword         TEXT    NOT NULL,
+    chat_id         TEXT    NOT NULL,
+    domain          TEXT    DEFAULT 'General',
+    status          TEXT    NOT NULL,
+    wow_growth      REAL    DEFAULT 0.0,
+    confidence      INTEGER DEFAULT 0,
+    interest        REAL    DEFAULT 0.0,
+    acceleration    REAL    DEFAULT 0.0,
+    consistency     REAL    DEFAULT 0.0,
+    peak_position   REAL    DEFAULT 0.0,
+    scanned_at      TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_history_chat_kw
+    ON scan_history (chat_id, keyword);
+
+CREATE INDEX IF NOT EXISTS idx_history_scanned
+    ON scan_history (scanned_at);
 """
 
 
@@ -154,3 +175,79 @@ async def update_keyword_status(
                 (status, wow_growth, confidence, now, keyword_id),
             )
         await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Scan History
+# ---------------------------------------------------------------------------
+
+async def insert_scan_history(
+    keyword: str,
+    chat_id: int | str,
+    domain: str,
+    status: str,
+    wow_growth: float,
+    confidence: int,
+    interest: float,
+    acceleration: float,
+    consistency: float,
+    peak_position: float,
+) -> None:
+    """Save a snapshot of a keyword scan into history."""
+    chat_id = str(chat_id)
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO scan_history "
+            "(keyword, chat_id, domain, status, wow_growth, confidence, "
+            " interest, acceleration, consistency, peak_position, scanned_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (keyword, chat_id, domain, status, wow_growth, confidence,
+             interest, acceleration, consistency, peak_position, now),
+        )
+        await db.commit()
+
+
+async def get_keyword_history(
+    chat_id: int | str,
+    keyword: str,
+    limit: int = 7,
+) -> list[dict]:
+    """Return recent scan history rows for a user + keyword, newest first."""
+    chat_id = str(chat_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT status, wow_growth, confidence, interest, "
+            " acceleration, consistency, peak_position, scanned_at "
+            "FROM scan_history "
+            "WHERE chat_id = ? AND keyword = ? "
+            "ORDER BY scanned_at DESC LIMIT ?",
+            (chat_id, keyword, limit),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_latest_user_snapshots(chat_id: int | str) -> list[dict]:
+    """Return the most recent history row per keyword for a user (for digest)."""
+    chat_id = str(chat_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT sh.keyword, sh.domain, sh.status, sh.wow_growth, "
+            " sh.confidence, sh.interest, sh.acceleration, "
+            " sh.consistency, sh.peak_position, sh.scanned_at "
+            "FROM scan_history sh "
+            "INNER JOIN ("
+            "  SELECT keyword, MAX(scanned_at) AS max_at "
+            "  FROM scan_history WHERE chat_id = ? "
+            "  GROUP BY keyword"
+            ") latest ON sh.keyword = latest.keyword "
+            "         AND sh.scanned_at = latest.max_at "
+            "WHERE sh.chat_id = ? "
+            "ORDER BY sh.scanned_at DESC",
+            (chat_id, chat_id),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
