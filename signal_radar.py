@@ -61,8 +61,8 @@ class ProxyManager:
     def available(self) -> bool:
         return len(self._proxies) > 0
 
-    def get_proxy(self) -> dict[str, str] | None:
-        """Return a random proxy dict for requests, or None."""
+    def get_proxy(self) -> str | None:
+        """Return a random proxy URL string, or None."""
         live = [p for p in self._proxies if p not in self._failed]
         if not live:
             # reset — give failed proxies another chance
@@ -70,13 +70,12 @@ class ProxyManager:
             live = list(self._proxies)
         if not live:
             return None
-        proxy = random.choice(live)
-        return {"http": proxy, "https": proxy}
+        return random.choice(live)
 
-    def mark_failed(self, proxy_dict: dict[str, str] | None) -> None:
+    def mark_failed(self, proxy_url: str | None) -> None:
         """Mark a proxy as failed so it's skipped next round."""
-        if proxy_dict:
-            self._failed.add(proxy_dict.get("http", ""))
+        if proxy_url:
+            self._failed.add(proxy_url)
 
     @classmethod
     def from_env(cls) -> "ProxyManager":
@@ -138,13 +137,13 @@ def fetch_trend_signals(
 
         for attempt in range(max_retries):
             # Pick a proxy (or None if no proxies configured)
-            proxies = proxy_manager.get_proxy()
+            proxy = proxy_manager.get_proxy()
 
             try:
                 pytrends = TrendReq(
                     hl=config.hl, tz=config.tz,
                     retries=2, backoff_factor=0.5,
-                    proxies=proxies,
+                    proxies=proxy if proxy else "",
                 )
 
                 # --- Attempt 1: exact keyword ---
@@ -181,7 +180,7 @@ def fetch_trend_signals(
                 exc_str = str(exc)
                 if "429" in exc_str:
                     print(f"[429] Rate limited on '{keyword}' (attempt {attempt + 1})")
-                    proxy_manager.mark_failed(proxies)
+                    proxy_manager.mark_failed(proxy)
                     time.sleep(random.uniform(5.0, 10.0))
                     continue
                 print(f"[WARN] '{keyword}' attempt {attempt + 1}: {exc}")
