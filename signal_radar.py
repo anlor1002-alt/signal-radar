@@ -103,6 +103,32 @@ class TrendSignalConfig:
     max_sleep_seconds: float = MAX_SLEEP_SECONDS
 
 
+# Multi-geo presets
+GEO_CONFIGS: dict[str, dict] = {
+    "VN": {"geo": "VN", "hl": "vi-VN", "tz": 420},
+    "US": {"geo": "US", "hl": "en-US", "tz": -300},
+    "WW": {"geo": "",   "hl": "en",    "tz": 0},
+}
+
+GEO_LABELS: dict[str, str] = {
+    "VN": "Vietnam",
+    "US": "United States",
+    "WW": "Toàn cầu",
+}
+
+GEO_FLAGS: dict[str, str] = {
+    "VN": "\U0001F1FB\U0001F1F3",
+    "US": "\U0001F1FA\U0001F1F8",
+    "WW": "\U0001F30D",
+}
+
+
+def make_geo_config(geo: str) -> TrendSignalConfig:
+    """Create a TrendSignalConfig for a specific geo code (VN, US, WW)."""
+    preset = GEO_CONFIGS.get(geo, GEO_CONFIGS["VN"])
+    return TrendSignalConfig(**preset)
+
+
 # ---------------------------------------------------------------------------
 # Module 1: Early Signal Ingestion
 # ---------------------------------------------------------------------------
@@ -358,6 +384,122 @@ def get_recommendation(domain: str, status: str) -> str:
     return DOMAIN_RECOMMENDATIONS.get(domain, DOMAIN_RECOMMENDATIONS["General"]).get(
         status, DOMAIN_RECOMMENDATIONS["General"]["STABLE"]
     )
+
+
+def fetch_suggestions(keyword: str, config: TrendSignalConfig | None = None) -> list[dict]:
+    """Fetch related queries for a keyword from Google Trends.
+
+    Returns a list of dicts with 'keyword' and 'value' keys, up to 10 items.
+    """
+    config = config or TrendSignalConfig()
+    timeframe = _build_timeframe(config.timeframe_days)
+
+    try:
+        pytrends = TrendReq(
+            hl=config.hl, tz=config.tz,
+            retries=2, backoff_factor=0.5,
+            proxies=proxy_manager.get_proxy() or "",
+        )
+        pytrends.build_payload([keyword], timeframe=timeframe, geo=config.geo)
+        related = pytrends.related_queries()
+
+        if not related or keyword not in related:
+            return []
+
+        # related_queries returns {"rising": DataFrame, "top": DataFrame}
+        rising = related[keyword].get("rising")
+        top = related[keyword].get("top")
+
+        results: list[dict] = []
+
+        # Prioritize rising queries
+        if rising is not None and not rising.empty:
+            for _, row in rising.head(5).iterrows():
+                query = str(row.get("query", ""))
+                val = str(row.get("value", ""))
+                if query:
+                    results.append({"keyword": query, "value": val, "type": "rising"})
+
+        # Then top queries
+        if top is not None and not top.empty:
+            for _, row in top.head(5).iterrows():
+                query = str(row.get("query", ""))
+                val = str(row.get("value", ""))
+                if query and not any(r["keyword"] == query for r in results):
+                    results.append({"keyword": query, "value": val, "type": "top"})
+
+        return results[:10]
+
+    except Exception as exc:
+        print(f"[SUGGEST] Error fetching suggestions for '{keyword}': {exc}")
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Action Decision Layer
+# ---------------------------------------------------------------------------
+# Translates raw metrics into a direct action recommendation.
+#
+# GO    — Strong momentum + enough confidence + not obviously late
+# WATCH — Promising but needs more confirmation
+# AVOID — Weak / declining / too late / low confidence
+# ---------------------------------------------------------------------------
+
+ActionLabel = str  # "GO" | "WATCH" | "AVOID"
+
+
+def compute_action(
+    status: str,
+    confidence: int,
+    wow_growth_pct: float,
+    peak_position_pct: float,
+    acceleration_pct: float,
+    consistency_pct: float,
+) -> tuple[ActionLabel, str]:
+    """Return (action_label, short_reason) for a keyword's current metrics.
+
+    Logic:
+      GO    — BURSTING or EMERGING with solid confidence, not at peak
+      WATCH — RISING, or moderate signals that need confirmation
+      AVOID — DECLINING, near peak (too late), or very weak confidence
+    """
+    # Normalise inf WoW to a large number for comparison
+    wow = 999.0 if wow_growth_pct == float("inf") else wow_growth_pct
+    peak = float(peak_position_pct)
+    accel = float(acceleration_pct)
+    consist = float(consistency_pct)
+
+    # --- GO conditions ---
+    if status == "BURSTING" and confidence >= 40:
+        return "GO", "Xu hướng bùng nổ, momentum rất mạnh."
+    if status == "EMERGING" and confidence >= 50 and peak < 85:
+        return "GO", "Tín hiệu sớm mạnh, chưa tới đỉnh — cơ hội tốt."
+    if status in ("EMERGING", "RISING") and wow > 80 and accel > 20 and consist >= 70:
+        return "GO", "Gia tốc cao + bền vững — xu hướng lên mạnh."
+
+    # --- AVOID conditions ---
+    if status == "DECLINING":
+        return "AVOID", "Xu hướng giảm — không nên đầu tư thêm."
+    if peak > 90 and wow < 5:
+        return "AVOID", "Đã gần đỉnh 30 ngày, tăng trưởng chậm — quá muộn."
+    if confidence < 15 and wow < 5:
+        return "AVOID", "Tín hiệu quá yếu — không đủ data để hành động."
+
+    # --- WATCH conditions (default for anything not GO or AVOID) ---
+    if status == "EMERGING":
+        return "WATCH", "Tín hiệu sớm — cần theo dõi thêm 1-2 ngày."
+    if status == "RISING":
+        return "WATCH", "Đang tăng đều — theo dõi momentum."
+    if status == "STABLE" and confidence >= 30:
+        return "WATCH", "Ổn định nhưng có tiềm năng — chờ tín hiệu rõ hơn."
+    if status == "STABLE":
+        return "WATCH", "Nhu cầu ổn — chưa có tín hiệu hành động."
+
+    return "WATCH", "Theo dõi thêm."
+
+
+ACTION_EMOJI = {"GO": "\U0001F7E2", "WATCH": "\U0001F7E1", "AVOID": "\U0001F534"}
+ACTION_LABEL_VI = {"GO": "HÀNH ĐỘNG", "WATCH": "THEO DÕI", "AVOID": "TRÁNH"}
 
 
 def _compute_ma(series: pd.Series, window: int) -> pd.Series:

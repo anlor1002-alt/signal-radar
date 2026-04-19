@@ -31,20 +31,37 @@ from telegram.ext import (
 )
 
 from signal_radar import (
+    ACTION_EMOJI,
+    ACTION_LABEL_VI,
+    GEO_FLAGS,
+    GEO_LABELS,
     TrendSignalConfig,
+    compute_action,
+    fetch_suggestions,
     fetch_trend_signals,
     get_recommendation,
+    make_geo_config,
     velocity_engine,
 )
 from database import (
     add_keyword,
+    create_project,
+    delete_project,
+    export_user_history_csv,
     get_all_tracked_keywords,
+    get_keywords_for_project_ids,
     get_keyword_history,
+    get_last_alert_time,
+    get_project,
+    get_project_keywords,
+    get_twice_daily_projects,
     get_user_keywords,
+    get_user_projects,
     init_db,
     insert_scan_history,
     register_user,
     remove_keyword,
+    update_alert_time,
     update_keyword_status,
 )
 
@@ -80,8 +97,75 @@ DOMAIN_EMOJI = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Signal Change (Delta) Logic
+# ---------------------------------------------------------------------------
+
+_DELTA_ARROWS = {
+    "up":   "\U0001F4C8",   # chart up
+    "down": "\U0001F4C9",   # chart down
+    "flat": "\U0001F4CA",   # chart flat
+}
+
+
+def compute_delta(current: dict, previous: dict | None) -> str:
+    """Compare current scan vs previous and return a short Vietnamese delta explanation.
+
+    Each dict should have at least: status, confidence, wow_growth, interest.
+    Returns a one-line string like 'Confidence +12 | WoW tăng mạnh | Status: RISING → EMERGING'
+    Returns empty string if no previous data.
+    """
+    if previous is None:
+        return ""
+
+    parts: list[str] = []
+
+    # --- Confidence delta ---
+    cur_conf = int(current.get("confidence", 0))
+    prev_conf = int(previous.get("confidence", 0))
+    conf_diff = cur_conf - prev_conf
+    if abs(conf_diff) >= 5:
+        arrow = "\U0001F4C8" if conf_diff > 0 else "\U0001F4C9"
+        parts.append(f"Conf {arrow}{conf_diff:+d}")
+
+    # --- Status change ---
+    cur_status = str(current.get("status", ""))
+    prev_status = str(previous.get("status", ""))
+    if cur_status != prev_status:
+        parts.append(f"{prev_status} → {cur_status}")
+
+    # --- WoW acceleration / cooling ---
+    cur_wow = current.get("wow_growth", 0)
+    prev_wow = previous.get("wow_growth", 0)
+    if cur_wow and prev_wow:
+        # Handle inf
+        cur_w = 999.0 if cur_wow == float("inf") else float(cur_wow)
+        prev_w = 999.0 if prev_wow == float("inf") else float(prev_wow)
+        wow_diff = cur_w - prev_w
+        if abs(wow_diff) > 10:
+            if wow_diff > 0:
+                parts.append("WoW tăng tốc")
+            else:
+                parts.append("WoW giảm tốc")
+
+    # --- Interest trend ---
+    cur_int = float(current.get("interest", 0))
+    prev_int = float(previous.get("interest", 0))
+    if prev_int > 0:
+        int_change = ((cur_int - prev_int) / prev_int) * 100
+        if int_change > 20:
+            parts.append("Interest tăng mạnh")
+        elif int_change < -20:
+            parts.append("Interest giảm")
+
+    if not parts:
+        return ""
+
+    return " | ".join(parts)
+
+
 def _format_single_report(row) -> str:
-    """Build a per-keyword HTML report."""
+    """Build a per-keyword HTML report with action label."""
     kw = html.escape(str(row["keyword"]))
     status = str(row["status"])
     domain = str(row.get("domain", "General"))
@@ -98,6 +182,13 @@ def _format_single_report(row) -> str:
 
     rec = get_recommendation(domain, status)
 
+    # Action label
+    action, reason = compute_action(
+        status, conf, wow, peak, accel, consistency,
+    )
+    act_emoji = ACTION_EMOJI[action]
+    act_vi = ACTION_LABEL_VI[action]
+
     filled = conf // 10
     bar = "\u2588" * filled + "\u2591" * (10 - filled)
 
@@ -107,6 +198,7 @@ def _format_single_report(row) -> str:
         f"  Interest: {interest} | WoW: {wow_str}%\n"
         f"  Gia tốc: {accel_str} | Bền vững: {consistency}%\n"
         f"  Đỉnh 30d: {peak}% | Confidence: {bar} {conf}/100\n"
+        f"  {act_emoji} <b>{act_vi}</b> — {reason}\n"
         f"  → <b>{rec}</b>"
     )
 
@@ -120,6 +212,16 @@ def _format_summary(results) -> str:
     rising = status_counts.get("RISING", 0)
     stable = status_counts.get("STABLE", 0)
     declining = status_counts.get("DECLINING", 0)
+
+    # Action label counts
+    action_counts = {"GO": 0, "WATCH": 0, "AVOID": 0}
+    for _, r in results.iterrows():
+        action, _ = compute_action(
+            str(r["status"]), int(r["confidence"]),
+            r["wow_growth_pct"], r["peak_position_pct"],
+            r["acceleration_pct"], r["consistency_pct"],
+        )
+        action_counts[action] += 1
 
     domain_counts = results["domain"].value_counts().to_dict() if "domain" in results.columns else {}
     domain_lines = []
@@ -147,6 +249,8 @@ def _format_summary(results) -> str:
 
     return (
         f"<b>TỔNG KẾT — {total} từ khóa</b>\n\n"
+        f"\U0001F7E2 GO: {action_counts['GO']} | \U0001F7E1 WATCH: {action_counts['WATCH']} | "
+        f"\U0001F534 AVOID: {action_counts['AVOID']}\n\n"
         f"\U0001F6A8 Bursting: {bursting} | \U0001F525 Emerging: {emerging} | "
         f"\U0001F4C8 Rising: {rising}\n"
         f"\U0001F4CA Stable: {stable} | \U0001F4C9 Declining: {declining}\n\n"
@@ -198,11 +302,21 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>Hướng dẫn sử dụng</b>\n\n"
         "/start — Menu chính (chọn lĩnh vực)\n"
         "/scan — Quét nhanh từ khóa\n"
-        "/track &lt;kw&gt; — Theo dõi từ khóa (quét tự động hàng ngày)\n"
-        "/untrack &lt;kw&gt; — Bỏ theo dõi\n"
-        "/mylist — Xem danh sách theo dõi (sắp xếp theo mức quan trọng)\n"
-        "/history &lt;kw&gt; — Xem lịch sử quét 7 ngày gần nhất\n"
-        "/help — Xem hướng dẫn này\n\n"
+        "/track &lt;kw&gt; [VN|US|WW] — Theo dõi từ khóa\n"
+        "/untrack &lt;kw&gt; [VN|US|WW] — Bỏ theo dõi\n"
+        "/mylist — Xem danh sách theo dõi + GO/WATCH/AVOID\n"
+        "/history &lt;kw&gt; — Xem lịch sử quét + xu hướng thay đổi\n"
+        "/compare kw1, kw2 — So sánh 2-5 từ khóa\n"
+        "/suggest &lt;kw&gt; — Gợi ý từ khóa liên quan\n"
+        "/export &lt;kw|project tên|all&gt; — Xuất CSV\n\n"
+        "<b>Projects:</b>\n"
+        "/pnew &lt;tên&gt; [daily|twice_daily] — Tạo project\n"
+        "/plist — Danh sách projects\n"
+        "/padd &lt;project&gt; &lt;kw&gt; [VN|US|WW] — Thêm từ khóa vào project\n"
+        "/pview &lt;project&gt; — Xem dashboard project\n"
+        "/pdel &lt;project&gt; — Xoá project\n\n"
+        "\U0001F7E2 GO = Hành động | \U0001F7E1 WATCH = Theo dõi | \U0001F534 AVOID = Tránh\n"
+        "\U0001F1FB\U0001F1F3 VN | \U0001F1FA\U0001F1F8 US | \U0001F30D WW (toàn cầu)\n\n"
         "Bot tự động quét từ khóa đã /track mỗi ngày\n"
         "và gửi báo cáo tổng hợp (digest) cho bạn.",
         parse_mode=ParseMode.HTML,
@@ -304,8 +418,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "2. Nhập từ khóa (cách nhau dấu phẩy)\n"
             "3. Bot phân tích và trả kết quả\n\n"
             "/track &lt;kw&gt; — Theo dõi tự động hàng ngày\n"
-            "/history &lt;kw&gt; — Xem lịch sử 7 ngày\n"
-            "/mylist — Danh sách theo dõi\n"
+            "/history &lt;kw&gt; — Xem lịch sử + xu hướng thay đổi\n"
+            "/mylist — Danh sách theo dõi + GO/WATCH/AVOID\n"
+            "/compare kw1, kw2 — So sánh cơ hội 2-5 từ khóa\n"
+            "/suggest &lt;kw&gt; — Gợi ý từ khóa liên quan\n"
             "/start — Menu chính\n"
             "/help — Xem hướng dẫn này",
             parse_mode=ParseMode.HTML,
@@ -328,64 +444,82 @@ async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 # ---------------------------------------------------------------------------
 
 async def cmd_track(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Add a keyword to the user's tracking list."""
+    """Add a keyword to the user's tracking list. Supports optional geo."""
     await register_user(update.effective_user.id)
 
     if not context.args:
         await update.message.reply_text(
-            "Dùng: <code>/track từ khóa</code>\nVí dụ: <code>/track mật ong</code>",
+            "Dùng: <code>/track từ khóa [VN|US|WW]</code>\n"
+            "Ví dụ: <code>/track mật ong</code> (VN mặc định)\n"
+            "       <code>/track collagen US</code>",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    keyword = " ".join(context.args).strip()
+    # Last arg might be a geo code
+    args = list(context.args)
+    geo = "VN"
+    if len(args) >= 2 and args[-1].upper() in ("VN", "US", "WW"):
+        geo = args.pop().upper()
+
+    keyword = " ".join(args).strip()
     if not keyword:
         return
 
     from signal_radar import detect_domain
     domain = detect_domain(keyword)
-    added = await add_keyword(update.effective_user.id, keyword, domain)
+    added = await add_keyword(update.effective_user.id, keyword, domain, geo=geo)
+
+    geo_flag = GEO_FLAGS.get(geo, "\U0001F310")
+    geo_label = GEO_LABELS.get(geo, geo)
 
     if added:
         de = DOMAIN_EMOJI.get(domain, "\U0001F310")
         await update.message.reply_text(
-            f"\u2705 Đã theo dõi: <b>{html.escape(keyword)}</b> {de} {domain}\n"
+            f"\u2705 Đã theo dõi: <b>{html.escape(keyword)}</b> {de} {domain} {geo_flag} {geo_label}\n"
             "Bot sẽ tự động quét hàng ngày và báo khi có thay đổi trạng thái.",
             parse_mode=ParseMode.HTML,
         )
     else:
         await update.message.reply_text(
-            f"Bạn đã theo dõi <b>{html.escape(keyword)}</b> rồi.",
+            f"Bạn đã theo dõi <b>{html.escape(keyword)}</b> {geo_flag} {geo_label} rồi.",
             parse_mode=ParseMode.HTML,
         )
 
 
 async def cmd_untrack(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Remove a keyword from the user's tracking list."""
+    """Remove a keyword from the user's tracking list. Supports optional geo."""
     if not context.args:
         await update.message.reply_text(
-            "Dùng: <code>/untrack từ khóa</code>",
+            "Dùng: <code>/untrack từ khóa [VN|US|WW]</code>\n"
+            "Không chỉ định geo = bỏ theo dõi tất cả thị trường.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    keyword = " ".join(context.args).strip()
-    removed = await remove_keyword(update.effective_user.id, keyword)
+    args = list(context.args)
+    geo = None
+    if len(args) >= 2 and args[-1].upper() in ("VN", "US", "WW"):
+        geo = args.pop().upper()
 
+    keyword = " ".join(args).strip()
+    removed = await remove_keyword(update.effective_user.id, keyword, geo=geo)
+
+    geo_str = f" {GEO_FLAGS.get(geo, '')} {geo}" if geo else " (tất cả thị trường)"
     if removed:
         await update.message.reply_text(
-            f"\u274C Đã bỏ theo dõi: <b>{html.escape(keyword)}</b>",
+            f"\u274C Đã bỏ theo dõi: <b>{html.escape(keyword)}</b>{geo_str}",
             parse_mode=ParseMode.HTML,
         )
     else:
         await update.message.reply_text(
-            f"Không tìm thấy <b>{html.escape(keyword)}</b> trong danh sách.",
+            f"Không tìm thấy <b>{html.escape(keyword)}</b>{geo_str} trong danh sách.",
             parse_mode=ParseMode.HTML,
         )
 
 
 async def cmd_mylist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show all tracked keywords sorted by importance."""
+    """Show all tracked keywords sorted by importance with action labels + geo + project."""
     keywords = await get_user_keywords(update.effective_user.id)
 
     if not keywords:
@@ -394,12 +528,17 @@ async def cmd_mylist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
-    # Sort by importance: BURSTING first, then by confidence descending
-    status_priority = {"BURSTING": 0, "EMERGING": 1, "RISING": 2, "STABLE": 3, "DECLINING": 4, "UNKNOWN": 5, "NEW": 5}
-    keywords.sort(key=lambda kw: (
-        status_priority.get(kw.get("last_status") or "NEW", 5),
-        -(kw.get("last_confidence") or 0),
-    ))
+    # Sort: GO first, then WATCH, then AVOID; within each by confidence desc
+    action_order = {"GO": 0, "WATCH": 1, "AVOID": 2}
+
+    def _kw_sort_key(kw):
+        status = kw.get("last_status") or "NEW"
+        conf = kw.get("last_confidence") or 0
+        wow = kw.get("last_wow_growth") or 0
+        action, _ = compute_action(status, conf, wow or 0, 50, 0, 50)
+        return (action_order.get(action, 2), -conf)
+
+    keywords.sort(key=_kw_sort_key)
 
     lines = [f"<b>Danh sách theo dõi ({len(keywords)})</b>\n"]
     for kw in keywords:
@@ -410,17 +549,251 @@ async def cmd_mylist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         wow = kw["last_wow_growth"]
         wow_str = f"{wow:+.1f}%" if wow and wow != 0 else "—"
         conf = kw["last_confidence"] or 0
+        geo = kw.get("geo") or "VN"
+        geo_flag = GEO_FLAGS.get(geo, "\U0001F310")
+
+        # Compute action from available data (use neutral defaults for missing metrics)
+        action, reason = compute_action(status, conf, wow or 0, 50, 0, 50)
+        act_emoji = ACTION_EMOJI[action]
+        act_vi = ACTION_LABEL_VI[action]
+
+        # Project info (show if assigned)
+        proj_line = ""
+        if kw.get("project_id"):
+            # We don't have project name here, just note it
+            proj_line = " \U0001F4CB"
 
         lines.append(
-            f"{emoji} {de} <b>{html.escape(kw['keyword'])}</b>\n"
-            f"  {status} | WoW: {wow_str} | Conf: {conf}/100"
+            f"{act_emoji} {geo_flag} {de} <b>{html.escape(kw['keyword'])}</b> [{geo}]{proj_line}\n"
+            f"  {emoji} {status} | WoW: {wow_str} | Conf: {conf}/100\n"
+            f"  <b>{act_vi}</b> — {reason}"
         )
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 # ---------------------------------------------------------------------------
-# /history command
+# Project Commands: /pnew, /plist, /padd, /pview, /pdel
+# ---------------------------------------------------------------------------
+
+async def cmd_pnew(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Create a new project. Syntax: /pnew <name> [daily|twice_daily]"""
+    await register_user(update.effective_user.id)
+
+    if not context.args:
+        await update.message.reply_text(
+            "Dùng: <code>/pnew tên_project [daily|twice_daily]</code>\n"
+            "Ví dụ: <code>/pnew skincare daily</code>\n"
+            "       <code>/pnew supplements twice_daily</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    args = list(context.args)
+    scan_freq = "daily"
+    if len(args) >= 2 and args[-1].lower() in ("daily", "twice_daily"):
+        scan_freq = args.pop().lower()
+
+    name = " ".join(args).strip().lower()
+    if not name:
+        return
+
+    created = await create_project(update.effective_user.id, name, scan_freq)
+    if created:
+        freq_vi = "2 lần/ngày" if scan_freq == "twice_daily" else "1 lần/ngày"
+        await update.message.reply_text(
+            f"\u2705 Tạo project: <b>{html.escape(name)}</b>\n"
+            f"Tần suất quét: {freq_vi}\n\n"
+            f"Dùng <code>/padd {name} từ_khóa</code> để thêm từ khóa.",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await update.message.reply_text(
+            f"Project <b>{html.escape(name)}</b> đã tồn tại.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def cmd_plist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List all projects for the user."""
+    projects = await get_user_projects(update.effective_user.id)
+
+    if not projects:
+        await update.message.reply_text(
+            "Chưa có project nào. Dùng <code>/pnew tên</code> để tạo.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    lines = ["<b>Danh sách Projects</b>\n"]
+    for p in projects:
+        freq_vi = "2x/ngày" if p["scan_freq"] == "twice_daily" else "1x/ngày"
+        lines.append(
+            f"\U0001F4CB <b>{html.escape(p['name'])}</b> ({p['kw_count']} từ khóa) — {freq_vi}\n"
+            f"  /pview {html.escape(p['name'])}"
+        )
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_padd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add a keyword to a project. Syntax: /padd <project> <keyword> [VN|US|WW]"""
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text(
+            "Dùng: <code>/padd project từ khóa [VN|US|WW]</code>\n"
+            "Ví dụ: <code>/padd skincare mật ong</code>\n"
+            "       <code>/padd skincare collagen US</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # First arg is project name, rest is keyword + optional geo
+    project_name = context.args[0].lower()
+    args = list(context.args[1:])
+
+    geo = "VN"
+    if len(args) >= 2 and args[-1].upper() in ("VN", "US", "WW"):
+        geo = args.pop().upper()
+
+    keyword = " ".join(args).strip()
+    if not keyword:
+        return
+
+    # Check project exists
+    project = await get_project(update.effective_user.id, project_name)
+    if not project:
+        await update.message.reply_text(
+            f"Project <b>{html.escape(project_name)}</b> không tồn tại.\n"
+            f"Dùng <code>/pnew {html.escape(project_name)}</code> để tạo.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    from signal_radar import detect_domain
+    domain = detect_domain(keyword)
+    added = await add_keyword(
+        update.effective_user.id, keyword, domain,
+        geo=geo, project_id=project["id"],
+    )
+
+    geo_flag = GEO_FLAGS.get(geo, "\U0001F310")
+    if added:
+        await update.message.reply_text(
+            f"\u2705 Thêm <b>{html.escape(keyword)}</b> {geo_flag} {geo} vào project <b>{html.escape(project_name)}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await update.message.reply_text(
+            f"<b>{html.escape(keyword)}</b> {geo_flag} {geo} đã có trong danh sách.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def cmd_pview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """View project dashboard."""
+    if not context.args:
+        await update.message.reply_text(
+            "Dùng: <code>/pview tên_project</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    project_name = " ".join(context.args).strip().lower()
+    project = await get_project(update.effective_user.id, project_name)
+
+    if not project:
+        await update.message.reply_text(
+            f"Project <b>{html.escape(project_name)}</b> không tồn tại.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    keywords = await get_project_keywords(update.effective_user.id, project_name)
+    freq_vi = "2 lần/ngày" if project["scan_freq"] == "twice_daily" else "1 lần/ngày"
+
+    lines = [
+        f"<b>Project: {html.escape(project_name)}</b> ({len(keywords)} từ khóa, {freq_vi})\n"
+    ]
+
+    if not keywords:
+        lines.append("Chưa có từ khóa. Dùng /padd để thêm.")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        return
+
+    action_order = {"GO": 0, "WATCH": 1, "AVOID": 2}
+
+    def _sort_key(kw):
+        status = kw.get("last_status") or "NEW"
+        conf = kw.get("last_confidence") or 0
+        wow = kw.get("last_wow_growth") or 0
+        action, _ = compute_action(status, conf, wow or 0, 50, 0, 50)
+        return (action_order.get(action, 2), -conf)
+
+    keywords.sort(key=_sort_key)
+
+    go_count = 0
+    watch_count = 0
+    avoid_count = 0
+
+    for kw in keywords:
+        status = kw["last_status"] or "NEW"
+        domain = kw["domain"] or "General"
+        emoji = STATUS_EMOJI.get(status, "\u2753")
+        de = DOMAIN_EMOJI.get(domain, "\U0001F310")
+        wow = kw["last_wow_growth"]
+        wow_str = f"{wow:+.1f}%" if wow and wow != 0 else "—"
+        conf = kw["last_confidence"] or 0
+        geo = kw.get("geo") or "VN"
+        geo_flag = GEO_FLAGS.get(geo, "\U0001F310")
+
+        action, reason = compute_action(status, conf, wow or 0, 50, 0, 50)
+        act_emoji = ACTION_EMOJI[action]
+        act_vi = ACTION_LABEL_VI[action]
+
+        if action == "GO":
+            go_count += 1
+        elif action == "AVOID":
+            avoid_count += 1
+        else:
+            watch_count += 1
+
+        lines.append(
+            f"{act_emoji} {geo_flag} <b>{html.escape(kw['keyword'])}</b> [{geo}]\n"
+            f"  {emoji} {status} | WoW: {wow_str} | Conf: {conf}\n"
+            f"  {reason}"
+        )
+
+    lines.append(
+        f"\n\U0001F7E2 GO: {go_count} | \U0001F7E1 WATCH: {watch_count} | \U0001F534 AVOID: {avoid_count}"
+    )
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_pdel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Delete a project. Keywords become unassigned (not deleted)."""
+    if not context.args:
+        await update.message.reply_text(
+            "Dùng: <code>/pdel tên_project</code>\n"
+            "Từ khóa trong project sẽ không bị xoá, chỉ gỡ khỏi project.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    project_name = " ".join(context.args).strip().lower()
+    deleted = await delete_project(update.effective_user.id, project_name)
+
+    if deleted:
+        await update.message.reply_text(
+            f"\u274C Đã xoá project <b>{html.escape(project_name)}</b>.\n"
+            "Từ khóa vẫn còn trong danh sách theo dõi.",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await update.message.reply_text(
+            f"Project <b>{html.escape(project_name)}</b> không tồn tại.",
+            parse_mode=ParseMode.HTML,
+        )
 # ---------------------------------------------------------------------------
 
 # Sparkline characters from low to high
@@ -440,7 +813,7 @@ def _sparkline(values: list[float]) -> str:
 
 
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show recent scan history for a tracked keyword."""
+    """Show recent scan history for a tracked keyword with action labels + delta."""
     if not context.args:
         await update.message.reply_text(
             "Dùng: <code>/history từ khóa</code>\nVí dụ: <code>/history mật ong</code>",
@@ -449,7 +822,7 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     keyword = " ".join(context.args).strip()
-    rows = await get_keyword_history(update.effective_user.id, keyword, limit=7)
+    rows = await get_keyword_history(update.effective_user.id, keyword, limit=10)
 
     if not rows:
         await update.message.reply_text(
@@ -460,13 +833,21 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     kw_escaped = html.escape(keyword)
-    lines = [f"<b>Lịch sử — {kw_escaped}</b> (7 ngày gần nhất)\n"]
+    lines = [f"<b>Lịch sử — {kw_escaped}</b> ({len(rows)} lần quét gần nhất)\n"]
 
-    # Build sparkline from interest values (reversed to chronological)
+    # Build sparkline from interest values (reversed to chronological order)
     interests = [r["interest"] for r in reversed(rows)]
     spark = _sparkline(interests)
 
-    for r in rows:
+    # Determine overall trend from first (newest) vs last (oldest)
+    if len(rows) >= 2:
+        newest = rows[0]
+        oldest = rows[-1]
+        trend_delta = compute_delta(newest, oldest)
+        if trend_delta:
+            lines.append(f"<b>Xu hướng tổng:</b> {trend_delta}\n")
+
+    for i, r in enumerate(rows):
         status = r["status"]
         emoji = STATUS_EMOJI.get(status, "\U0001F4CA")
         wow = r["wow_growth"]
@@ -475,14 +856,201 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         interest = int(r["interest"])
         date_str = r["scanned_at"][:10]  # YYYY-MM-DD
 
+        # Action label (from DB column, or compute if missing for old rows)
+        act_label = r.get("action_label") or ""
+        if act_label:
+            act_emoji = ACTION_EMOJI.get(act_label, "")
+            act_vi = ACTION_LABEL_VI.get(act_label, "")
+            act_line = f" | {act_emoji} {act_vi}"
+        else:
+            act_line = ""
+
+        # Delta vs previous row
+        prev_row = rows[i + 1] if i + 1 < len(rows) else None
+        delta = compute_delta(r, prev_row)
+        delta_line = f"\n    ↪ {delta}" if delta else ""
+
         lines.append(
             f"{emoji} {date_str} | {status} | WoW: {wow_str} | "
-            f"Int: {interest} | Conf: {conf}"
+            f"Int: {interest} | Conf: {conf}{act_line}{delta_line}"
         )
 
     lines.append(f"\nInterest trend: <code>{spark}</code>")
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+# ---------------------------------------------------------------------------
+# /compare command — rank 2-5 keywords by opportunity
+# ---------------------------------------------------------------------------
+
+async def cmd_compare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Compare 2-5 keywords side-by-side, ranked by opportunity."""
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text(
+            "Dùng: <code>/compare kw1, kw2, kw3</code> (2-5 từ khóa)\n"
+            "Ví dụ: <code>/compare mật ong, tinh bột nghệ, collagen</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Parse keywords — support both comma-separated and space-separated
+    raw = " ".join(context.args)
+    keywords = [kw.strip() for kw in raw.split(",") if kw.strip()]
+
+    if len(keywords) < 2:
+        await update.message.reply_text("Cần ít nhất 2 từ khóa để so sánh.")
+        return
+    if len(keywords) > 5:
+        keywords = keywords[:5]
+        await update.message.reply_text(f"Giới hạn 5 từ khóa. So sánh: {', '.join(keywords)}")
+
+    processing_msg = await update.message.reply_text(
+        f"\u23F3 Đang so sánh {len(keywords)} từ khóa... (mất ~{len(keywords) * 5}s)"
+    )
+
+    config = TrendSignalConfig()
+    interest_df = await asyncio.to_thread(fetch_trend_signals, keywords, config)
+
+    if interest_df.empty:
+        await processing_msg.edit_text(
+            "Không lấy được dữ liệu Google Trends. Kiểm tra lại từ khóa."
+        )
+        return
+
+    results = await asyncio.to_thread(velocity_engine, interest_df)
+
+    if results.empty:
+        await processing_msg.edit_text("Không đủ dữ liệu để phân tích.")
+        return
+
+    # Compute action + opportunity score for ranking
+    action_order = {"GO": 0, "WATCH": 1, "AVOID": 2}
+    rows_with_action = []
+    for _, row in results.iterrows():
+        status = str(row["status"])
+        conf = int(row["confidence"])
+        wow = row["wow_growth_pct"]
+        peak = float(row["peak_position_pct"])
+        accel = float(row["acceleration_pct"])
+        consist = float(row["consistency_pct"])
+
+        action, reason = compute_action(status, conf, wow, peak, accel, consist)
+        rows_with_action.append((row, action, reason))
+
+    # Sort: GO first, then WATCH, then AVOID; within each by confidence desc
+    rows_with_action.sort(
+        key=lambda x: (action_order.get(x[1], 2), -int(x[0]["confidence"]))
+    )
+
+    # Build comparison table
+    lines = [f"<b>SO SÁNH CƠ HỘI — {len(rows_with_action)} từ khóa</b>\n"]
+    lines.append(f"{'Rank':<5} {'Từ khóa':<20} {'Hành động':<12} {'Status':<12} {'Conf':<6} {'WoW'}")
+    lines.append("\u2500" * 45)
+
+    for rank, (row, action, reason) in enumerate(rows_with_action, 1):
+        kw = html.escape(str(row["keyword"]))
+        status = str(row["status"])
+        emoji = STATUS_EMOJI.get(status, "\U0001F4CA")
+        act_emoji = ACTION_EMOJI[action]
+        act_vi = ACTION_LABEL_VI[action]
+        conf = int(row["confidence"])
+        wow = row["wow_growth_pct"]
+        wow_str = "INF" if wow == float("inf") else f"{wow:+.0f}%"
+        domain = str(row.get("domain", "General"))
+        de = DOMAIN_EMOJI.get(domain, "\U0001F310")
+
+        medal = ""
+        if rank == 1:
+            medal = "\U0001F947 "
+        elif rank == 2:
+            medal = "\U0001F948 "
+        elif rank == 3:
+            medal = "\U0001F949 "
+
+        lines.append(
+            f"{medal}<b>#{rank}</b> {de} <b>{kw}</b>\n"
+            f"  {act_emoji} <b>{act_vi}</b> | {emoji} {status} | "
+            f"WoW: {wow_str} | Conf: {conf}/100\n"
+            f"  {reason}"
+        )
+
+    # Winner callout
+    winner_row, winner_action, winner_reason = rows_with_action[0]
+    winner_kw = html.escape(str(winner_row["keyword"]))
+    if winner_action == "GO":
+        lines.append(
+            f"\n\U0001F3C6 <b>Cơ hội tốt nhất:</b> {winner_kw} — HÀNH ĐỘNG!"
+        )
+    elif winner_action == "WATCH":
+        lines.append(
+            f"\n\U0001F448 <b>Đáng chú ý nhất:</b> {winner_kw} — Theo dõi sát."
+        )
+    else:
+        lines.append(
+            f"\n\U0001F6A7 <b>Kết quả:</b> Không có cơ hội rõ ràng — chờ thêm tín hiệu."
+        )
+
+    await processing_msg.edit_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+# ---------------------------------------------------------------------------
+# /suggest command — discover related keywords
+# ---------------------------------------------------------------------------
+
+async def cmd_suggest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Suggest related keywords using Google Trends related queries."""
+    if not context.args:
+        await update.message.reply_text(
+            "Dùng: <code>/suggest từ khóa</code>\n"
+            "Ví dụ: <code>/suggest mật ong</code>\n\n"
+            "Bot sẽ tìm các từ khóa liên quan đang trending.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    keyword = " ".join(context.args).strip()
+    processing_msg = await update.message.reply_text(
+        f"\U0001F50D Đang tìm từ khóa liên quan đến <b>{html.escape(keyword)}</b>..."
+    )
+
+    config = TrendSignalConfig()
+    suggestions = await asyncio.to_thread(fetch_suggestions, keyword, config)
+
+    if not suggestions:
+        await processing_msg.edit_text(
+            f"Không tìm thấy từ khóa liên quan cho <b>{html.escape(keyword)}</b>.\n"
+            "Thử từ khóa khác hoặc kiểm tra lại chính tả.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    lines = [f"<b>Gợi ý — {html.escape(keyword)}</b>\n"]
+
+    rising = [s for s in suggestions if s["type"] == "rising"]
+    top = [s for s in suggestions if s["type"] == "top"]
+
+    if rising:
+        lines.append("\U0001F525 <b>Đang tăng:</b>")
+        for s in rising:
+            kw = html.escape(s["keyword"])
+            val = html.escape(s["value"]) if s["value"] else ""
+            val_str = f" ({val})" if val else ""
+            lines.append(f"  \u2022 {kw}{val_str}")
+        lines.append("")
+
+    if top:
+        lines.append("\U0001F4C8 <b>Phổ biến:</b>")
+        for s in top:
+            kw = html.escape(s["keyword"])
+            val = html.escape(s["value"]) if s["value"] else ""
+            val_str = f" ({val})" if val else ""
+            lines.append(f"  \u2022 {kw}{val_str}")
+
+    lines.append(f"\n\u2022 Dùng <code>/track từ khóa</code> để theo dõi")
+    lines.append(f"\u2022 Dùng <code>/compare {html.escape(keyword)}, từ_khóa_2</code> để so sánh")
+
+    await processing_msg.edit_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 # ---------------------------------------------------------------------------
@@ -492,44 +1060,73 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 _BURSTING_IMMEDIATE = {"BURSTING"}
 
 
-async def _daily_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _daily_scan(context: ContextTypes.DEFAULT_TYPE, keywords_override: list[dict] | None = None) -> None:
     """Background job: scan tracked keywords, save history, push digest + alerts."""
-    print("[TRACKER] Daily scan starting...")
-    all_keywords = await get_all_tracked_keywords()
+    print("[TRACKER] Scan starting...")
+    all_keywords = keywords_override or await get_all_tracked_keywords()
 
     if not all_keywords:
         print("[TRACKER] No tracked keywords — skipping.")
         return
 
-    unique_keywords = list({kw["keyword"] for kw in all_keywords})
-    config = TrendSignalConfig()
+    # Group by geo for multi-market scanning
+    geo_groups: dict[str, list[dict]] = {}
+    for kw in all_keywords:
+        geo = kw.get("geo") or "VN"
+        geo_groups.setdefault(geo, []).append(kw)
 
-    interest_df = await asyncio.to_thread(fetch_trend_signals, unique_keywords, config)
-    if interest_df.empty:
-        print("[TRACKER] No data fetched — skipping.")
-        return
+    # Process each geo separately
+    all_results: list[tuple[dict, dict, str]] = []  # (row, tracked, geo)
 
-    results = await asyncio.to_thread(velocity_engine, interest_df)
-    if results.empty:
-        print("[TRACKER] Velocity engine returned empty — skipping.")
-        return
+    for geo, geo_keywords in geo_groups.items():
+        config = make_geo_config(geo)
+        unique_keywords = list({kw["keyword"] for kw in geo_keywords})
 
-    result_map = {str(row["keyword"]): row for _, row in results.iterrows()}
-
-    # ---- Phase 1: Save history + update tracked_keywords ----
-    for tracked in all_keywords:
-        row = result_map.get(tracked["keyword"])
-        if row is None:
+        interest_df = await asyncio.to_thread(fetch_trend_signals, unique_keywords, config)
+        if interest_df.empty:
+            print(f"[TRACKER] No data for geo={geo} — skipping.")
             continue
 
+        results = await asyncio.to_thread(velocity_engine, interest_df)
+        if results.empty:
+            print(f"[TRACKER] Velocity engine empty for geo={geo} — skipping.")
+            continue
+
+        result_map = {str(row["keyword"]): row for _, row in results.iterrows()}
+
+        # Compute action labels
+        for kw_name, row in result_map.items():
+            status = str(row["status"])
+            conf = int(row["confidence"])
+            wow = row["wow_growth_pct"]
+            peak = float(row["peak_position_pct"])
+            accel = float(row["acceleration_pct"])
+            consist = float(row["consistency_pct"])
+            action_map_key = (kw_name, geo)
+            # Store in result_map row
+            row["_action"] = compute_action(status, conf, wow, peak, accel, consist)
+
+        for tracked in geo_keywords:
+            row = result_map.get(tracked["keyword"])
+            if row is None:
+                continue
+            all_results.append((dict(row), tracked, geo))
+
+    if not all_results:
+        print("[TRACKER] No results across all geos — skipping.")
+        return
+
+    # ---- Phase 1: Save history + update tracked_keywords ----
+    for row, tracked, geo in all_results:
         new_status = str(row["status"])
         wow = float(row["wow_growth_pct"]) if row["wow_growth_pct"] != float("inf") else 999.0
         conf = int(row["confidence"])
-        domain = str(row.get("domain", tracked["domain"] or "General"))
+        domain = str(row.get("domain", tracked.get("domain") or "General"))
         interest = float(row["interest"])
         accel = float(row["acceleration_pct"])
         consistency = float(row["consistency_pct"])
         peak = float(row["peak_position_pct"])
+        action, reason = row.get("_action", ("WATCH", ""))
 
         await insert_scan_history(
             keyword=tracked["keyword"],
@@ -542,6 +1139,9 @@ async def _daily_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
             acceleration=accel,
             consistency=consistency,
             peak_position=peak,
+            action_label=action,
+            action_reason=reason,
+            geo=geo,
         )
 
         await update_keyword_status(
@@ -552,28 +1152,56 @@ async def _daily_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
             domain=domain,
         )
 
-    # ---- Phase 2: Immediate BURSTING alerts ----
-    for tracked in all_keywords:
-        row = result_map.get(tracked["keyword"])
-        if row is None:
-            continue
+    # ---- Phase 2: Immediate BURSTING alerts (with noise reduction) ----
+    _ALERT_COOLDOWN_HOURS = 24
 
+    for row, tracked, geo in all_results:
         new_status = str(row["status"])
-        old_status = tracked["last_status"] or "UNKNOWN"
-        if new_status not in _BURSTING_IMMEDIATE or old_status == new_status:
+        old_status = tracked.get("last_status") or "UNKNOWN"
+        action, reason = row.get("_action", ("WATCH", ""))
+
+        # Noise reduction: only alert on status transition to BURSTING/EMERGING
+        if new_status not in {"BURSTING", "EMERGING"} or old_status == new_status:
             continue
 
-        domain = str(row.get("domain", tracked["domain"] or "General"))
+        # Noise reduction: must be GO or high confidence
         conf = int(row["confidence"])
+        if action != "GO" and conf < 30:
+            continue
+
+        # Noise reduction: 24h cooldown per keyword
+        last_alert = await get_last_alert_time(tracked["id"])
+        if last_alert:
+            try:
+                last_dt = datetime.fromisoformat(last_alert)
+                hours_since = (datetime.utcnow() - last_dt).total_seconds() / 3600
+                if hours_since < _ALERT_COOLDOWN_HOURS:
+                    continue
+            except (ValueError, TypeError):
+                pass
+
+        domain = str(row.get("domain", tracked.get("domain") or "General"))
         wow = float(row["wow_growth_pct"]) if row["wow_growth_pct"] != float("inf") else 999.0
         de = DOMAIN_EMOJI.get(domain, "\U0001F310")
         rec = get_recommendation(domain, new_status)
+        act_emoji = ACTION_EMOJI[action]
+        act_vi = ACTION_LABEL_VI[action]
+        geo_flag = GEO_FLAGS.get(geo, "\U0001F310")
+
+        delta = compute_delta(
+            {"status": new_status, "confidence": conf, "wow_growth": wow,
+             "interest": float(row["interest"])},
+            {"status": old_status, "confidence": tracked.get("last_confidence") or 0,
+             "wow_growth": tracked.get("last_wow_growth") or 0, "interest": 0},
+        )
+        delta_line = f"\n↪ {delta}" if delta else ""
 
         message = (
-            f"<b>\U0001F6A8 BURSTING ALERT \U0001F6A8</b>\n\n"
-            f"<b>{html.escape(tracked['keyword'])}</b> {de} {domain}\n"
+            f"<b>\U0001F6A8 {new_status} ALERT \U0001F6A8</b>\n\n"
+            f"<b>{html.escape(tracked['keyword'])}</b> {geo_flag} {geo} {de} {domain}\n"
             f"Trạng thái: {old_status} → <b>{new_status}</b>\n"
             f"Wow: +{wow:.1f}% | Confidence: {conf}/100\n"
+            f"{act_emoji} <b>{act_vi}</b> — {reason}{delta_line}\n"
             f"→ <b>{rec}</b>"
         )
 
@@ -583,45 +1211,98 @@ async def _daily_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
                 text=message,
                 parse_mode=ParseMode.HTML,
             )
+            await update_alert_time(tracked["id"])
         except Exception as exc:
             print(f"[TRACKER] Failed to alert {tracked['chat_id']}: {exc}")
 
-    # ---- Phase 3: Per-user daily digest ----
-    user_chat_ids = list({kw["chat_id"] for kw in all_keywords})
-    status_order = {"BURSTING": 0, "EMERGING": 1, "RISING": 2, "STABLE": 3, "DECLINING": 4}
+    # ---- Phase 3: Per-user daily digest (portfolio style) ----
+    user_chat_ids = list({kw["chat_id"] for kw in all_keywords}) if keywords_override is None else list({t["chat_id"] for _, t, _ in all_results})
 
     for chat_id in user_chat_ids:
-        user_rows = []
-        for tracked in all_keywords:
-            if tracked["chat_id"] != chat_id:
-                continue
-            row = result_map.get(tracked["keyword"])
-            if row is not None:
-                user_rows.append(row)
+        user_items = [(r, t, g) for r, t, g in all_results if t["chat_id"] == chat_id]
 
-        if not user_rows:
+        if not user_items:
             continue
 
-        user_rows.sort(
-            key=lambda r: (status_order.get(str(r["status"]), 5), -int(r["confidence"]))
-        )
+        # Partition into GO / WATCH / AVOID
+        go_items: list[tuple] = []
+        watch_items: list[tuple] = []
+        avoid_items: list[tuple] = []
 
-        lines = ["<b>BÁO CÁO HÀNG NGÀY</b>\n"]
-        for row in user_rows:
-            status = str(row["status"])
-            domain = str(row.get("domain", "General"))
-            emoji = STATUS_EMOJI.get(status, "\U0001F4CA")
-            de = DOMAIN_EMOJI.get(domain, "\U0001F310")
-            kw = html.escape(str(row["keyword"]))
-            wow = row["wow_growth_pct"]
-            wow_str = "INF" if wow == float("inf") else f"{wow:+.1f}"
-            conf = int(row["confidence"])
-            interest = int(round(float(row["interest"])))
+        for row, tracked, geo in user_items:
+            action, reason = row.get("_action", ("WATCH", ""))
 
-            lines.append(
-                f"{emoji} {de} <b>{kw}</b>\n"
-                f"  {status} | Int: {interest} | WoW: {wow_str}% | Conf: {conf}"
+            delta = compute_delta(
+                {"status": str(row["status"]), "confidence": int(row["confidence"]),
+                 "wow_growth": row["wow_growth_pct"], "interest": float(row["interest"])},
+                {"status": tracked.get("last_status") or "UNKNOWN",
+                 "confidence": tracked.get("last_confidence") or 0,
+                 "wow_growth": tracked.get("last_wow_growth") or 0, "interest": 0},
             )
+
+            entry = (row, action, reason, delta, geo)
+            if action == "GO":
+                go_items.append(entry)
+            elif action == "AVOID":
+                avoid_items.append(entry)
+            else:
+                watch_items.append(entry)
+
+        # Build takeaway
+        parts = []
+        if go_items:
+            parts.append(f"{len(go_items)} cơ hội đáng vào")
+        if watch_items:
+            parts.append(f"{len(watch_items)} từ khóa cần theo dõi")
+        if avoid_items:
+            parts.append(f"{len(avoid_items)} tín hiệu đang yếu đi")
+        takeaway = "Hôm nay có " + ", ".join(parts) + "." if parts else "Không có thay đổi đáng chú ý."
+
+        # Hottest keyword by geo
+        all_sorted = sorted(user_items, key=lambda x: -int(x[0]["confidence"]))
+        hottest = all_sorted[0] if all_sorted else None
+        hottest_line = ""
+        if hottest:
+            h_row, _, h_geo = hottest
+            h_flag = GEO_FLAGS.get(h_geo, "\U0001F310")
+            hottest_line = (
+                f"\U0001F525 Hot nhất: <b>{html.escape(str(h_row['keyword']))}</b> {h_flag} {h_geo} "
+                f"(Conf: {int(h_row['confidence'])})"
+            )
+
+        lines = [f"<b>BÁO CÁO HÀNG NGÀY</b>\n"]
+        lines.append(f"<i>{takeaway}</i>")
+        if hottest_line:
+            lines.append(f"{hottest_line}\n")
+
+        def _format_section(title: str, emoji: str, items: list[tuple]) -> None:
+            if not items:
+                return
+            items.sort(key=lambda x: -int(x[0]["confidence"]))
+            lines.append(f"{emoji} <b>{title}</b>")
+            for row, action, reason, delta, geo in items:
+                status = str(row["status"])
+                domain = str(row.get("domain", "General"))
+                s_emoji = STATUS_EMOJI.get(status, "\U0001F4CA")
+                de = DOMAIN_EMOJI.get(domain, "\U0001F310")
+                kw = html.escape(str(row["keyword"]))
+                wow = row["wow_growth_pct"]
+                wow_str = "INF" if wow == float("inf") else f"{wow:+.1f}"
+                conf = int(row["confidence"])
+                interest = int(round(float(row["interest"])))
+                geo_flag = GEO_FLAGS.get(geo, "\U0001F310")
+                delta_line = f"\n  ↪ {delta}" if delta else ""
+
+                lines.append(
+                    f"  {geo_flag} {de} <b>{kw}</b> [{geo}]\n"
+                    f"  {s_emoji} {status} | Int: {interest} | WoW: {wow_str}% | Conf: {conf}\n"
+                    f"  {reason}{delta_line}"
+                )
+            lines.append("")
+
+        _format_section("HÀNH ĐỘNG", "\U0001F7E2", go_items)
+        _format_section("THEO DÕI", "\U0001F7E1", watch_items)
+        _format_section("TRÁNH / YẾU", "\U0001F534", avoid_items)
 
         try:
             await context.bot.send_message(
@@ -632,7 +1313,92 @@ async def _daily_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception as exc:
             print(f"[TRACKER] Failed to send digest to {chat_id}: {exc}")
 
-    print(f"[TRACKER] Scan complete — {len(all_keywords)} keywords processed.")
+    total = len(all_results)
+    print(f"[TRACKER] Scan complete — {total} keywords processed across {len(geo_groups)} geos.")
+
+
+# ---------------------------------------------------------------------------
+# /export command — export scan history as CSV
+# ---------------------------------------------------------------------------
+
+import tempfile
+
+
+async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Export scan history as CSV. /export [keyword|project_name|all]"""
+    if not context.args:
+        await update.message.reply_text(
+            "Dùng: <code>/export từ_khóa</code> — xuất 1 từ khóa\n"
+            "     <code>/export project tên</code> — xuất theo project\n"
+            "     <code>/export all</code> — xuất tất cả",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    args = list(context.args)
+
+    if args[0].lower() == "project" and len(args) >= 2:
+        project_name = " ".join(args[1:]).strip().lower()
+        project = await get_project(update.effective_user.id, project_name)
+        if not project:
+            await update.message.reply_text(
+                f"Project <b>{html.escape(project_name)}</b> không tồn tại.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        csv_content = await export_user_history_csv(update.effective_user.id, project_name=project_name)
+        filename = f"signal_radar_{project_name}.csv"
+    elif args[0].lower() == "all":
+        csv_content = await export_user_history_csv(update.effective_user.id)
+        filename = "signal_radar_all.csv"
+    else:
+        keyword = " ".join(args).strip()
+        csv_content = await export_user_history_csv(update.effective_user.id, keyword=keyword)
+        filename = f"signal_radar_{keyword.replace(' ', '_')}.csv"
+
+    if not csv_content.strip():
+        await update.message.reply_text("Không có dữ liệu để xuất.")
+        return
+
+    # Write to temp file and send as document
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".csv", delete=False, encoding="utf-8"
+    ) as f:
+        f.write(csv_content)
+        tmp_path = f.name
+
+    try:
+        with open(tmp_path, "rb") as f:
+            await update.message.reply_document(
+                document=f,
+                filename=filename,
+                caption=f"Signal Radar — {filename}",
+            )
+    finally:
+        os.unlink(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Midday scan for twice_daily projects
+# ---------------------------------------------------------------------------
+
+async def _midday_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run the midday scan for twice_daily projects only."""
+    print("[TRACKER] Midday scan for twice_daily projects...")
+    twice_daily = await get_twice_daily_projects()
+
+    if not twice_daily:
+        print("[TRACKER] No twice_daily projects — skipping midday.")
+        return
+
+    project_ids = [p["id"] for p in twice_daily]
+    keywords = await get_keywords_for_project_ids(project_ids)
+
+    if not keywords:
+        print("[TRACKER] No keywords in twice_daily projects — skipping.")
+        return
+
+    await _daily_scan(context, keywords_override=keywords)
 
 
 # ---------------------------------------------------------------------------
@@ -673,6 +1439,14 @@ def main() -> None:
     application.add_handler(CommandHandler("untrack", cmd_untrack))
     application.add_handler(CommandHandler("mylist", cmd_mylist))
     application.add_handler(CommandHandler("history", cmd_history))
+    application.add_handler(CommandHandler("compare", cmd_compare))
+    application.add_handler(CommandHandler("suggest", cmd_suggest))
+    application.add_handler(CommandHandler("export", cmd_export))
+    application.add_handler(CommandHandler("pnew", cmd_pnew))
+    application.add_handler(CommandHandler("plist", cmd_plist))
+    application.add_handler(CommandHandler("padd", cmd_padd))
+    application.add_handler(CommandHandler("pview", cmd_pview))
+    application.add_handler(CommandHandler("pdel", cmd_pdel))
     application.add_handler(CallbackQueryHandler(button_callback))
 
     # Catch free-text when user clicked the inline button (not in /scan conversation)
@@ -686,7 +1460,13 @@ def main() -> None:
         time=datetime.strptime("00:00", "%H:%M").time(),
     )
 
-    print("Signal Radar bot v3 is running... Press Ctrl+C to stop.")
+    # Midday scan for twice_daily projects at 12:00
+    application.job_queue.run_daily(
+        _midday_scan,
+        time=datetime.strptime("12:00", "%H:%M").time(),
+    )
+
+    print("Signal Radar bot v5 is running... Press Ctrl+C to stop.")
     application.run_polling()
 
 
