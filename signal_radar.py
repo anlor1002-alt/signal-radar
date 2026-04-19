@@ -90,20 +90,45 @@ def fetch_trend_signals(
     keyword_series: dict[str, pd.Series] = {}
 
     for index, keyword in enumerate(keywords):
+        fetched = False
+
+        # --- Attempt 1: exact keyword ---
         try:
             pytrends.build_payload([keyword], timeframe=timeframe, geo=config.geo)
             interest_df = pytrends.interest_over_time()
 
-            if interest_df.empty:
-                print(f"[WARN] No trend data returned for '{keyword}'.")
-                continue
+            if not interest_df.empty:
+                series = interest_df[keyword].copy()
+                series.name = keyword
+                keyword_series[keyword] = series
+                print(f"[OK] '{keyword}' — {len(series)} daily points.")
+                fetched = True
+        except Exception as exc:
+            print(f"[WARN] Attempt 1 failed for '{keyword}': {exc}")
 
-            series = interest_df[keyword].copy()
-            series.name = keyword
-            keyword_series[keyword] = series
-            print(f"[OK] Retrieved {len(series)} daily points for '{keyword}'.")
-        except Exception as exc:  # pragma: no cover - network/API behavior
-            print(f"[ERROR] Failed to fetch '{keyword}': {exc}")
+        # --- Attempt 2: auto-suggest from Google Trends ---
+        if not fetched:
+            try:
+                suggestions = pytrends.suggestions(keyword)
+                if suggestions:
+                    alt = suggestions[0]["title"]
+                    print(f"[RETRY] '{keyword}' → trying suggestion: '{alt}'")
+                    time.sleep(random.uniform(1.0, 2.5))
+
+                    pytrends.build_payload([alt], timeframe=timeframe, geo=config.geo)
+                    interest_df = pytrends.interest_over_time()
+
+                    if not interest_df.empty:
+                        series = interest_df[alt].copy()
+                        series.name = keyword  # keep original name for display
+                        keyword_series[keyword] = series
+                        print(f"[OK] '{keyword}' (via '{alt}') — {len(series)} daily points.")
+                        fetched = True
+            except Exception as exc:
+                print(f"[WARN] Suggestion retry failed for '{keyword}': {exc}")
+
+        if not fetched:
+            print(f"[FAIL] No data for '{keyword}' — skipped.")
 
         if index < len(keywords) - 1:
             sleep_seconds = random.uniform(
