@@ -154,6 +154,128 @@ INTEREST_BURSTING = 20
 INTEREST_EMERGING = 10
 
 
+# ---------------------------------------------------------------------------
+# Domain Detection
+# ---------------------------------------------------------------------------
+
+DOMAIN_RULES: list[tuple[str, list[str]]] = [
+    ("E-commerce", [
+        "thực phẩm", "đồ ăn", "hạt", "mật ", "tinh bột", "đường", "đồ uống",
+        "trà", "cà phê", "coffee", "nước", "snack", "bánh", "kẹo", "gia vị",
+        "nông sản", "thủy sản", "hải sản", "rau", "củ", "quả", "thịt",
+        "nhập hàng", "bán lẻ", "shopee", "tiktok shop", "lazada",
+    ]),
+    ("Fashion", [
+        "áo", "quần", "giày", "túi", "thời trang", "sneaker", "váy",
+        "đầm", "kính", "đồng hồ", "mũ", "nón", "túi xách", "balo",
+        "hoodie", "jacket", "sơ mi", "jean", "denim",
+    ]),
+    ("Health & Beauty", [
+        "thuốc", "kem ", "serum", "vitamin", "detox", "giảm cân", "làm đẹp",
+        "skincare", "makeup", "son", "phấn", "mascara", "chăm sóc da",
+        "dưỡng", "trị mụn", "chống nắng", "tẩy", "tóc", "body",
+        "thực phẩm chức năng", "omega", "collagen",
+    ]),
+    ("Technology", [
+        "ai ", "gpt", "opus", "claude", "gemini", "phone", "laptop", "phone",
+        "phần mềm", "app ", "code", "python", "javascript", "react",
+        "chip", "gpu", "cpu", "ram", "ssd", "iphone", "samsung", "xiaomi",
+        "robot", "điện thoại", "máy tính", "table", "ipad", "macbook",
+        "chatgpt", "openai", "anthropic", "midjourney",
+    ]),
+    ("Finance", [
+        "chứng khoán", "crypto", "bitcoin", "coin", "đầu tư", "cổ phiếu",
+        "ethereum", "binance", "forex", "vàng", "bạc", "tài chính",
+        "lãi suất", "inflation", "gdp", "thị trường", "trading",
+    ]),
+    ("Entertainment", [
+        "game", "phim", "nhạc", "idol", "anime", "manga", "kpop", "vpop",
+        "concert", "festival", "show", "streaming", "netflix", "youtube",
+        "tiktok", "esport", "gaming",
+    ]),
+    ("Education", [
+        "học", "khóa học", "đào tạo", "chứng chỉ", "ielts", "toeic",
+        "universit", "thi ", "ôn thi", "sách ", "giáo trình", "tutorial",
+        "course", "training", "skill",
+    ]),
+]
+
+DOMAIN_RECOMMENDATIONS: dict[str, dict[str, str]] = {
+    "E-commerce": {
+        "BURSTING":  "Nhập hàng ngay / Lên chiến dịch marketing!",
+        "EMERGING":  "Chuẩn bị nguồn hàng / Lên kế hoạch bán.",
+        "RISING":    "Cân nhắc nhập thêm / Theo dõi đối thủ.",
+        "STABLE":    "Nhu cầu ổn định — duy trì tồn kho.",
+        "DECLINING": "Nhu cầu giảm — hạn chế nhập hàng.",
+    },
+    "Fashion": {
+        "BURSTING":  "Lên collection ngay / Nhập hàng xu hướng!",
+        "EMERGING":  "Xu hướng đang lên — chuẩn bị mẫu mới.",
+        "RISING":    "Cân nhắc bổ sung size/màu hot.",
+        "STABLE":    "Mặt hàng cơ bản — giữ mức tồn kho.",
+        "DECLINING": "Xu hướng hạ — clearance sale.",
+    },
+    "Health & Beauty": {
+        "BURSTING":  "Đẩy mạnh chiến dịch wellness / Cập nhật sản phẩm!",
+        "EMERGING":  "Xu hướng làm đẹp mới — nghiên cứu sản phẩm.",
+        "RISING":    "Nhu cầu tăng — bổ sung listing.",
+        "STABLE":    "Sản phẩm ổn định — duy trì.",
+        "DECLINING": "Trend giảm — chuyển focus.",
+    },
+    "Technology": {
+        "BURSTING":  "Nghiên cứu công nghệ / Đầu tư sớm!",
+        "EMERGING":  "Tín hiệu công nghệ mới — tìm hiểu ngay.",
+        "RISING":    "Công nghệ đang phổ biến — theo dõi.",
+        "STABLE":    "Công nghệ ổn định — phổ thông.",
+        "DECLINING":  "Công nghệ lỗi thời — chú ý.",
+    },
+    "Finance": {
+        "BURSTING":  "Phân tích đầu tư gấp / Theo dõi thị trường!",
+        "EMERGING":  "Tín hiệu tài chính — cân nhắc vị thế.",
+        "RISING":    "Thị trường tích cực — theo dõi tiếp.",
+        "STABLE":    "Thị trường sideway — chờ đợi.",
+        "DECLINING": "Thị trường tiêu cực — phòng thủ.",
+    },
+    "Entertainment": {
+        "BURSTING":  "Tạo content ngay / Phân tích xu hướng media!",
+        "EMERGING":  "Trend media mới — lên content plan.",
+        "RISING":    "Nội dung đang hot — ride trend.",
+        "STABLE":    "Content ổn — duy trì lịch đăng.",
+        "DECLINING": "Trend hạ — tìm nội dung mới.",
+    },
+    "Education": {
+        "BURSTING":  "Tạo khóa học / Nội dung giáo dục mới!",
+        "EMERGING":  "Nhu cầu học tập tăng — phát triển content.",
+        "RISING":    "Chủ đề hot — cân nhắc xây khóa học.",
+        "STABLE":    "Nhu cầu học ổn định — duy trì.",
+        "DECLINING": "Quan tâm giảm — cập nhật nội dung.",
+    },
+    "General": {
+        "BURSTING":  "Xu hướng bùng nổ — hành động ngay!",
+        "EMERGING":  "Tín hiệu sớm — theo dõi sát.",
+        "RISING":    "Xu hướng tăng — phân tích thêm.",
+        "STABLE":    "Ổn định — không có tín hiệu mạnh.",
+        "DECLINING": "Giảm — không nên đầu tư.",
+    },
+}
+
+
+def detect_domain(keyword: str) -> str:
+    """Classify a keyword into a domain based on pattern matching."""
+    kw_lower = keyword.lower()
+    for domain, patterns in DOMAIN_RULES:
+        if any(p in kw_lower for p in patterns):
+            return domain
+    return "General"
+
+
+def get_recommendation(domain: str, status: str) -> str:
+    """Return a domain-specific recommendation for the given status."""
+    return DOMAIN_RECOMMENDATIONS.get(domain, DOMAIN_RECOMMENDATIONS["General"]).get(
+        status, DOMAIN_RECOMMENDATIONS["General"]["STABLE"]
+    )
+
+
 def _compute_ma(series: pd.Series, window: int) -> pd.Series:
     """Simple moving average over *window* days."""
     return series.rolling(window=window, min_periods=window).mean()
@@ -270,6 +392,7 @@ def velocity_engine(interest_df: pd.DataFrame) -> pd.DataFrame:
 
         # --- Classify ---
         status = _classify(wow, current_interest, latest_ma7, latest_ma30)
+        domain = detect_domain(keyword)
 
         # --- Confidence ---
         conf = _confidence_score(wow, current_interest, consistency, accel, peak_pos)
@@ -279,6 +402,7 @@ def velocity_engine(interest_df: pd.DataFrame) -> pd.DataFrame:
 
         rows.append({
             "keyword":            keyword,
+            "domain":             domain,
             "interest":           round(current_interest, 1),
             "ma7":                round(latest_ma7, 1),
             "ma14":               round(latest_ma14, 1),

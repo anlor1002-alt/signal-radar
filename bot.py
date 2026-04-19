@@ -32,6 +32,7 @@ from telegram.ext import (
 from signal_radar import (
     TrendSignalConfig,
     fetch_trend_signals,
+    get_recommendation,
     velocity_engine,
 )
 
@@ -55,12 +56,15 @@ STATUS_EMOJI = {
     "DECLINING": "\U0001F4C9",
 }
 
-STATUS_LABEL_VI = {
-    "BURSTING":  "BÙNG NỔ — Nhập hàng ngay!",
-    "EMERGING":  "ĐANG NỔI — Theo dõi sát",
-    "RISING":    "ĐANG TĂNG — Cân nhắc nhập",
-    "STABLE":    "ỔN ĐỊNH — Nhu cầu đều",
-    "DECLINING": "GIẢM — Không nên nhập",
+DOMAIN_EMOJI = {
+    "E-commerce":      "\U0001F6D2",
+    "Fashion":         "\U0001F455",
+    "Health & Beauty": "\U0001F9F4",
+    "Technology":      "\U0001F4BB",
+    "Finance":         "\U0001F4B0",
+    "Entertainment":   "\U0001F3AC",
+    "Education":       "\U0001F4DA",
+    "General":         "\U0001F310",
 }
 
 
@@ -75,8 +79,9 @@ def _format_results_message(results) -> str:
     for _, row in results.iterrows():
         kw = html.escape(str(row["keyword"]))
         status = str(row["status"])
+        domain = str(row.get("domain", "General"))
         emoji = STATUS_EMOJI.get(status, "\U0001F4CA")
-        label = STATUS_LABEL_VI.get(status, status)
+        domain_emoji = DOMAIN_EMOJI.get(domain, "\U0001F310")
         wow = row["wow_growth_pct"]
         wow_str = "INF" if wow == float("inf") else f"{wow:.1f}"
         conf = int(row["confidence"])
@@ -86,16 +91,19 @@ def _format_results_message(results) -> str:
         accel_str = f"{accel:+.1f}%"
         interest = int(round(float(row["interest"])))
 
+        # Domain-specific recommendation
+        rec = get_recommendation(domain, status)
+
         # Confidence bar
         filled = conf // 10
         bar = "\u2588" * filled + "\u2591" * (10 - filled)
 
         lines.append(
-            f"{emoji} <b>{kw}</b>\n"
+            f"{emoji} <b>{kw}</b> {domain_emoji} {domain}\n"
             f"  Interest: {interest} | WoW: +{wow_str}%\n"
             f"  Gia tốc: {accel_str} | Bền vững: {consistency}%\n"
             f"  Đỉnh 30d: {peak}% | Confidence: {bar} {conf}/100\n"
-            f"  → <b>{label}</b>"
+            f"  → <b>{rec}</b>"
         )
 
     # --- Summary block ---
@@ -107,20 +115,30 @@ def _format_results_message(results) -> str:
     stable = status_counts.get("STABLE", 0)
     declining = status_counts.get("DECLINING", 0)
 
+    # Domain breakdown
+    domain_counts = results["domain"].value_counts().to_dict() if "domain" in results.columns else {}
+    domain_lines = []
+    for d, count in domain_counts.items():
+        de = DOMAIN_EMOJI.get(d, "\U0001F310")
+        domain_lines.append(f"  {de} {d}: {count}")
+
     # Top 3 by confidence
-    top3 = results.nlargest(3, "confidence")[["keyword", "confidence", "status"]]
+    top3 = results.nlargest(3, "confidence")[["keyword", "confidence", "status", "domain"]]
     top_lines = []
     for _, r in top3.iterrows():
         e = STATUS_EMOJI.get(str(r["status"]), "")
-        top_lines.append(f"  {e} {html.escape(str(r['keyword']))} ({int(r['confidence'])}/100)")
+        de = DOMAIN_EMOJI.get(str(r.get("domain", "")), "")
+        top_lines.append(
+            f"  {e} {de} {html.escape(str(r['keyword']))} ({int(r['confidence'])}/100)"
+        )
 
     # Overall recommendation
     if bursting > 0:
         rec = "\U0001F6A8 Xu hướng bùng nổ phát hiện — hành động ngay!"
     elif emerging > 0:
-        rec = "\U0001F525 Tín hiệu sớm — chuẩn bị nhập hàng."
+        rec = "\U0001F525 Tín hiệu sớm — cần theo dõi sát."
     elif rising > 0:
-        rec = "\U0001F4C8 Xu hướng đang tăng — theo dõi thêm."
+        rec = "\U0001F4C8 Xu hướng đang tăng — phân tích thêm."
     else:
         rec = "\U0001F4CA Thị trường ổn định — chưa có tín hiệu mạnh."
 
@@ -130,7 +148,8 @@ def _format_results_message(results) -> str:
         f"\U0001F6A8 Bursting: {bursting} | \U0001F525 Emerging: {emerging} | "
         f"\U0001F4C8 Rising: {rising}\n"
         f"\U0001F4CA Stable: {stable} | \U0001F4C9 Declining: {declining}\n\n"
-        f"<b>Top tiềm năng:</b>\n" + "\n".join(top_lines) + f"\n\n{rec}"
+        f"<b>Lĩnh vực:</b>\n" + "\n".join(domain_lines) +
+        f"\n\n<b>Top tiềm năng:</b>\n" + "\n".join(top_lines) + f"\n\n{rec}"
     )
 
     return "\n\n".join(lines)
