@@ -331,7 +331,7 @@ def _confidence_score(
     return int(min(growth_pts + level_pts + consist_pts + accel_pts + peak_pts, 100))
 
 
-def velocity_engine(interest_df: pd.DataFrame) -> pd.DataFrame:
+def velocity_engine(interest_df: pd.DataFrame, domain_override: str | None = None) -> pd.DataFrame:
     """
     Analyse every keyword column and return a rich summary DataFrame.
 
@@ -392,7 +392,7 @@ def velocity_engine(interest_df: pd.DataFrame) -> pd.DataFrame:
 
         # --- Classify ---
         status = _classify(wow, current_interest, latest_ma7, latest_ma30)
-        domain = detect_domain(keyword)
+        domain = domain_override or detect_domain(keyword)
 
         # --- Confidence ---
         conf = _confidence_score(wow, current_interest, consistency, accel, peak_pos)

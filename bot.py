@@ -160,17 +160,33 @@ def _format_results_message(results) -> str:
 # ---------------------------------------------------------------------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send welcome message with inline menu."""
+    """Send welcome message with domain selection menu."""
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("\U0001F50D Quét trend", callback_data="scan")],
-        [InlineKeyboardButton("\U0001F4D6 Hướng dẫn", callback_data="help")],
+        [
+            InlineKeyboardButton("\U0001F6D2 E-commerce", callback_data="domain:E-commerce"),
+            InlineKeyboardButton("\U0001F455 Fashion", callback_data="domain:Fashion"),
+        ],
+        [
+            InlineKeyboardButton("\U0001F9F4 Sức khỏe & Làm đẹp", callback_data="domain:Health & Beauty"),
+            InlineKeyboardButton("\U0001F4BB Công nghệ", callback_data="domain:Technology"),
+        ],
+        [
+            InlineKeyboardButton("\U0001F4B0 Tài chính", callback_data="domain:Finance"),
+            InlineKeyboardButton("\U0001F3AC Giải trí", callback_data="domain:Entertainment"),
+        ],
+        [
+            InlineKeyboardButton("\U0001F4DA Giáo dục", callback_data="domain:Education"),
+            InlineKeyboardButton("\U0001F310 Tự phát hiện", callback_data="domain:auto"),
+        ],
+        [
+            InlineKeyboardButton("\U0001F4D6 Hướng dẫn", callback_data="help"),
+        ],
     ])
 
     await update.message.reply_text(
         "<b>SIGNAL RADAR</b>\n\n"
-        "Chào bạn! Bot giúp phát hiện xu hướng sản phẩm e-commerce "
-        "trước 2-4 tuần khi demand bùng nổ.\n\n"
-        "Nhấn nút bên dưới hoặc dùng lệnh:",
+        "Phát hiện xu hướng trước 2-4 tuần khi demand bùng nổ.\n\n"
+        "Chọn lĩnh vực muốn quét:",
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard,
     )
@@ -206,6 +222,7 @@ async def handle_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """Receive keywords, run the pipeline, reply with results."""
     raw_text = update.message.text.strip()
     keywords = [kw.strip() for kw in raw_text.split(",") if kw.strip()]
+    domain_override = context.user_data.pop("selected_domain", None)
 
     if not keywords:
         await update.message.reply_text("Không nhận được từ khóa hợp lệ. Thử lại hoặc /cancel.")
@@ -233,7 +250,7 @@ async def handle_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return ConversationHandler.END
 
-    results = await asyncio.to_thread(velocity_engine, interest_df)
+    results = await asyncio.to_thread(velocity_engine, interest_df, domain_override)
     reply = _format_results_message(results)
 
     # Telegram message limit is 4096 chars — split if needed
@@ -269,23 +286,27 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     await query.answer()
 
-    if query.data == "scan":
+    if query.data and query.data.startswith("domain:"):
+        domain = query.data.split(":", 1)[1]
+        context.user_data["selected_domain"] = domain if domain != "auto" else None
+        context.user_data["awaiting_keywords"] = True
+
+        domain_label = domain if domain != "auto" else "Tự phát hiện"
         await query.message.reply_text(
-            "\U0001F50D <b>Nhập từ khóa cần quét</b>\n\n"
-            "Gửi từ khóa, cách nhau bằng dấu phẩy.\n"
+            f"\U0001F50D <b>Lĩnh vực: {domain_label}</b>\n\n"
+            "Nhập từ khóa cần quét, cách nhau bằng dấu phẩy.\n"
             "Ví dụ: <i>mật ong, tinh bột nghệ, đường ăn kiêng</i>\n\n"
             "Gửi /cancel để huỷ.",
             parse_mode=ParseMode.HTML,
         )
-        # Set state manually since we're outside ConversationHandler
-        context.user_data["awaiting_keywords"] = True
     elif query.data == "help":
         await query.message.reply_text(
             "<b>Hướng dẫn sử dụng</b>\n\n"
-            "/scan — Bắt đầu quét từ khóa\n"
-            "  Nhập mỗi từ khóa cách nhau bằng dấu phẩy.\n"
-            "  Ví dụ: <i>mật ong, tinh bột nghệ, đường ăn kiêng</i>\n\n"
-            "/start — Về menu chính\n"
+            "1. Nhấn /start → chọn lĩnh vực\n"
+            "2. Nhập từ khóa (cách nhau dấu phẩy)\n"
+            "3. Bot phân tích và trả kết quả\n\n"
+            "Hoặc dùng /scan để quét nhanh (tự detect lĩnh vực).\n\n"
+            "/start — Menu chính\n"
             "/help — Xem hướng dẫn này",
             parse_mode=ParseMode.HTML,
         )
