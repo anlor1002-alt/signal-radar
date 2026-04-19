@@ -43,6 +43,13 @@ from signal_radar import (
     make_geo_config,
     velocity_engine,
 )
+from sources import (
+    KeywordResolution,
+    OpportunityResult,
+    fetch_multi_source_suggestions,
+    multi_source_engine,
+    resolve_keyword,
+)
 from database import (
     add_keyword,
     create_project,
@@ -260,6 +267,150 @@ def _format_summary(results) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Multi-Source Opportunity Formatters
+# ---------------------------------------------------------------------------
+
+_QUALITY_BADGES = {
+    "COMMERCIAL":     "\U0001F4B0",
+    "INFORMATIONAL":  "\U0001F4D6",
+    "BRAND":          "\u2122\uFE0F",
+    "AMBIGUOUS":      "\u26A0\uFE0F",
+    "BROAD":          "\U0001F30D",
+    "PERSON":         "\U0001F464",
+}
+
+
+def _format_opportunity_report(opp: OpportunityResult) -> str:
+    """Build a per-keyword HTML report with multi-source opportunity score."""
+    kw = html.escape(opp.keyword)
+    status = opp.status
+    domain = opp.domain
+    emoji = STATUS_EMOJI.get(status, "\U0001F4CA")
+    domain_emoji = DOMAIN_EMOJI.get(domain, "\U0001F310")
+    wow = opp.wow_growth_pct
+    wow_str = "INF" if wow == float("inf") else f"{wow:+.1f}"
+    conf = opp.confidence
+
+    act_emoji = ACTION_EMOJI[opp.action_label]
+    act_vi = ACTION_LABEL_VI[opp.action_label]
+
+    filled = conf // 10
+    bar = "\u2588" * filled + "\u2591" * (10 - filled)
+
+    rec = get_recommendation(domain, status)
+
+    # Source indicator dots
+    source_dots = []
+    for sig in opp.sources:
+        if sig.success:
+            source_dots.append("\U0001F7E2")  # green
+        else:
+            source_dots.append("\U0001F534")  # red
+    source_bar = "".join(source_dots)
+
+    q_badge = _QUALITY_BADGES.get(opp.keyword_quality_label, "")
+
+    # Marketplace validation line
+    mp_line = ""
+    if opp.marketplace_presence > 0 or opp.marketplace_intent > 0:
+        presence_str = f"{opp.marketplace_presence:.0%}"
+        intent_str = f"{opp.marketplace_intent:.0%}"
+        crowd_emoji = "\U0001F7E2" if opp.crowding_risk < 0.3 else ("\U0001F7E1" if opp.crowding_risk < 0.6 else "\U0001F534")
+        mp_line = (
+            f"  \U0001F6D2 Marketplace: {presence_str} presence | "
+            f"{intent_str} intent | {crowd_emoji} crowding {opp.crowding_risk:.0%}\n"
+        )
+
+    # Decision card: Kết luận / Vì sao / Tiếp theo
+    why = opp.action_reason
+    next_step = ""
+    if opp.resolution:
+        why = opp.resolution.resolver_reason
+        next_step = opp.resolution.next_action
+    else:
+        if opp.action_label == "GO":
+            next_step = "Hành động ngay — dùng /track để theo dõi tự động"
+        elif opp.action_label == "WATCH":
+            next_step = "Theo dõi sát — /compare với từ khóa tương tự"
+        else:
+            next_step = "Chưa đủ tín hiệu — thử từ khóa cụ thể hơn"
+
+    return (
+        f"<b>SIGNAL RADAR</b>\n\n"
+        f"{emoji} <b>{kw}</b> {domain_emoji} {domain}\n"
+        f"  Interest: {int(opp.interest)} | WoW: {wow_str}%\n"
+        f"  Gia tốc: {opp.acceleration_pct:+.1f}% | Bền vững: {int(opp.consistency_pct)}%\n"
+        f"  Đỉnh 30d: {int(opp.peak_position_pct)}% | Confidence: {bar} {conf}/100\n"
+        f"  <b>Opportunity: {opp.opportunity_score}/100</b> | "
+        f"Nguồn: {source_bar} {opp.source_count}/4 | "
+        f"Đồng thuận: {opp.source_agreement:.0%}\n"
+        f"{mp_line}"
+        f"  {q_badge} {opp.keyword_quality_label}\n"
+        f"  \U0001F4CB <b>Kết luận:</b> {act_emoji} {act_vi}\n"
+        f"  \U0001F4A1 <b>Vì sao:</b> {why}\n"
+        f"  \U0001F449 <b>Tiếp:</b> {next_step}\n"
+        f"  <i>{opp.evidence_summary}</i>"
+    )
+
+
+def _format_opportunity_summary(results: list[OpportunityResult]) -> str:
+    """Build summary from multi-source opportunity results."""
+    total = len(results)
+    action_counts = {"GO": 0, "WATCH": 0, "AVOID": 0}
+    status_counts: dict[str, int] = {}
+    domain_counts: dict[str, int] = {}
+
+    for r in results:
+        action_counts[r.action_label] = action_counts.get(r.action_label, 0) + 1
+        status_counts[r.status] = status_counts.get(r.status, 0) + 1
+        domain_counts[r.domain] = domain_counts.get(r.domain, 0) + 1
+
+    bursting = status_counts.get("BURSTING", 0)
+    emerging = status_counts.get("EMERGING", 0)
+    rising = status_counts.get("RISING", 0)
+    stable = status_counts.get("STABLE", 0)
+    declining = status_counts.get("DECLINING", 0)
+
+    domain_lines = []
+    for d, count in domain_counts.items():
+        de = DOMAIN_EMOJI.get(d, "\U0001F310")
+        domain_lines.append(f"  {de} {d}: {count}")
+
+    top3 = results[:3]  # already sorted by opportunity_score
+    top_lines = []
+    for r in top3:
+        e = STATUS_EMOJI.get(r.status, "")
+        de = DOMAIN_EMOJI.get(r.domain, "\U0001F310")
+        top_lines.append(
+            f"  {e} {de} {html.escape(r.keyword)} "
+            f"({r.opportunity_score}/100)"
+        )
+
+    avg_opp = sum(r.opportunity_score for r in results) / max(total, 1)
+
+    if bursting > 0:
+        rec = "\U0001F6A8 Xu hướng bùng nổ phát hiện — hành động ngay!"
+    elif emerging > 0:
+        rec = "\U0001F525 Tín hiệu sớm — cần theo dõi sát."
+    elif rising > 0:
+        rec = "\U0001F4C8 Xu hướng đang tăng — phân tích thêm."
+    else:
+        rec = "\U0001F4CA Thị trường ổn định — chưa có tín hiệu mạnh."
+
+    return (
+        f"<b>TỔNG KẾT — {total} từ khóa</b>\n"
+        f"<b>Trung bình Opportunity: {avg_opp:.1f}/100</b>\n\n"
+        f"\U0001F7E2 GO: {action_counts['GO']} | \U0001F7E1 WATCH: {action_counts['WATCH']} | "
+        f"\U0001F534 AVOID: {action_counts['AVOID']}\n\n"
+        f"\U0001F6A8 Bursting: {bursting} | \U0001F525 Emerging: {emerging} | "
+        f"\U0001F4C8 Rising: {rising}\n"
+        f"\U0001F4CA Stable: {stable} | \U0001F4C9 Declining: {declining}\n\n"
+        f"<b>Lĩnh vực:</b>\n" + "\n".join(domain_lines) +
+        f"\n\n<b>Top cơ hội:</b>\n" + "\n".join(top_lines) + f"\n\n{rec}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Command Handlers
 # ---------------------------------------------------------------------------
 
@@ -284,6 +435,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ],
         [
             InlineKeyboardButton("\U0001F4D6 Hướng dẫn", callback_data="help"),
+            InlineKeyboardButton("\U0001F3C6 Top cơ hội", callback_data="top"),
         ],
     ])
 
@@ -308,7 +460,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/history &lt;kw&gt; — Xem lịch sử quét + xu hướng thay đổi\n"
         "/compare kw1, kw2 — So sánh 2-5 từ khóa\n"
         "/suggest &lt;kw&gt; — Gợi ý từ khóa liên quan\n"
-        "/export &lt;kw|project tên|all&gt; — Xuất CSV\n\n"
+        "/export &lt;kw|project tên|all&gt; — Xuất CSV\n"
+        "/top — Xem top cơ hội hiện tại\n\n"
         "<b>Projects:</b>\n"
         "/pnew &lt;tên&gt; [daily|twice_daily] — Tạo project\n"
         "/plist — Danh sách projects\n"
@@ -354,7 +507,7 @@ async def handle_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # Let user know we're working on it
     processing_msg = await update.message.reply_text(
-        f"\u23F3 Đang phân tích {len(keywords)} từ khóa... (mất ~{len(keywords) * 5}s)"
+        f"\u23F3 Đang phân tích {len(keywords)} từ khóa (multi-source)... (mất ~{len(keywords) * 8}s)"
     )
 
     # Run the heavy pipeline in a thread so the bot stays responsive
@@ -367,21 +520,65 @@ async def handle_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return ConversationHandler.END
 
-    results = await asyncio.to_thread(velocity_engine, interest_df, domain_override)
+    velocity_df = await asyncio.to_thread(velocity_engine, interest_df, domain_override)
 
-    if results.empty:
+    if velocity_df.empty:
         await processing_msg.edit_text("Không đủ dữ liệu để phân tích.")
         return ConversationHandler.END
 
+    # Multi-source enrichment
+    geo_code = "VN"  # default geo for interactive scans
+    opportunities = await asyncio.to_thread(
+        multi_source_engine, velocity_df, geo_code, domain_override,
+    )
+
     # Send individual report per keyword
-    await processing_msg.edit_text(f"Phân tích xong {len(results)} từ khóa!")
-    for _, row in results.iterrows():
-        report = _format_single_report(row)
-        await update.message.reply_text(report, parse_mode=ParseMode.HTML)
+    await processing_msg.edit_text(f"Phân tích xong {len(opportunities)} từ khóa (multi-source)!")
+
+    # Store resolutions for inline button callbacks
+    resolve_index = 0
+    for opp in opportunities:
+        report = _format_opportunity_report(opp)
+
+        # If keyword is weak, offer inline buttons for refined variants
+        if opp.resolution and opp.resolution.is_weak and opp.resolution.refined_keywords:
+            res_key = f"res_{resolve_index}"
+            context.user_data[res_key] = {
+                "original": opp.keyword,
+                "refined": opp.resolution.refined_keywords,
+                "quality": opp.resolution.quality_label,
+            }
+            resolve_index += 1
+
+            # Build inline keyboard with next-step options
+            variants_str = ", ".join(opp.resolution.refined_keywords[:3])
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        f"\U0001F50D Quét biến thể ({len(opp.resolution.refined_keywords)})",
+                        callback_data=f"res:s:{res_key}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "\U0001F4CA So sánh biến thể",
+                        callback_data=f"res:c:{res_key}",
+                    ),
+                    InlineKeyboardButton(
+                        "\u2705 Vẫn theo dõi",
+                        callback_data=f"res:t:{res_key}",
+                    ),
+                ],
+            ])
+            await update.message.reply_text(
+                report, parse_mode=ParseMode.HTML, reply_markup=keyboard,
+            )
+        else:
+            await update.message.reply_text(report, parse_mode=ParseMode.HTML)
         await asyncio.sleep(0.3)
 
     # Send summary
-    summary = _format_summary(results)
+    summary = _format_opportunity_summary(opportunities)
     await update.message.reply_text(summary, parse_mode=ParseMode.HTML)
 
     return ConversationHandler.END
@@ -422,10 +619,125 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "/mylist — Danh sách theo dõi + GO/WATCH/AVOID\n"
             "/compare kw1, kw2 — So sánh cơ hội 2-5 từ khóa\n"
             "/suggest &lt;kw&gt; — Gợi ý từ khóa liên quan\n"
+            "/top — Xem top cơ hội hiện tại\n"
             "/start — Menu chính\n"
             "/help — Xem hướng dẫn này",
             parse_mode=ParseMode.HTML,
         )
+    elif query.data == "top":
+        # Trigger /top via inline button — build a fake update
+        await cmd_top(update, context)
+
+
+async def resolve_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline button callbacks from keyword resolver suggestions."""
+    query = update.callback_query
+    await query.answer()
+
+    if not query.data or not query.data.startswith("res:"):
+        return
+
+    parts = query.data.split(":", 2)
+    if len(parts) < 3:
+        return
+
+    action = parts[1]  # s=scan, c=compare, t=track
+    res_key = parts[2]
+
+    res_data = context.user_data.get(res_key)
+    if not res_data:
+        await query.message.reply_text(
+            "Dữ liệu gợi ý đã hết hạn. Dùng /scan để quét lại."
+        )
+        return
+
+    original = res_data["original"]
+    refined = res_data["refined"]
+
+    if action == "s":
+        # Scan refined variants
+        keywords = refined[:5]
+        await query.message.reply_text(
+            f"\U0001F50D Đang quét {len(keywords)} biến thể của <b>{html.escape(original)}</b>...",
+            parse_mode=ParseMode.HTML,
+        )
+        config = TrendSignalConfig()
+        interest_df = await asyncio.to_thread(fetch_trend_signals, keywords, config)
+        if interest_df.empty:
+            await query.message.reply_text("Không lấy được dữ liệu. Thử lại sau.")
+            return
+        velocity_df = await asyncio.to_thread(velocity_engine, interest_df)
+        if velocity_df.empty:
+            await query.message.reply_text("Không đủ dữ liệu để phân tích.")
+            return
+        opportunities = await asyncio.to_thread(multi_source_engine, velocity_df, "VN")
+        for opp in opportunities:
+            report = _format_opportunity_report(opp)
+            await query.message.reply_text(report, parse_mode=ParseMode.HTML)
+            await asyncio.sleep(0.3)
+        if opportunities:
+            summary = _format_opportunity_summary(opportunities)
+            await query.message.reply_text(summary, parse_mode=ParseMode.HTML)
+
+    elif action == "c":
+        # Compare refined variants
+        if len(refined) < 2:
+            await query.message.reply_text("Cần ít nhất 2 biến thể để so sánh.")
+            return
+        keywords = refined[:5]
+        await query.message.reply_text(
+            f"\U0001F4CA Đang so sánh {len(keywords)} biến thể...",
+            parse_mode=ParseMode.HTML,
+        )
+        config = TrendSignalConfig()
+        interest_df = await asyncio.to_thread(fetch_trend_signals, keywords, config)
+        if interest_df.empty:
+            await query.message.reply_text("Không lấy được dữ liệu.")
+            return
+        velocity_df = await asyncio.to_thread(velocity_engine, interest_df)
+        if velocity_df.empty:
+            await query.message.reply_text("Không đủ dữ liệu.")
+            return
+        opportunities = await asyncio.to_thread(multi_source_engine, velocity_df, "VN")
+
+        lines = [f"<b>SO SÁNH BIẾN THỂ — {html.escape(original)}</b>\n"]
+        for rank, opp in enumerate(opportunities, 1):
+            kw_e = html.escape(opp.keyword)
+            emoji = STATUS_EMOJI.get(opp.status, "\U0001F4CA")
+            act_emoji = ACTION_EMOJI[opp.action_label]
+            wow = opp.wow_growth_pct
+            wow_str = "INF" if wow == float("inf") else f"{wow:+.0f}%"
+            medal = "\U0001F947 " if rank == 1 else ("\U0001F948 " if rank == 2 else "")
+            lines.append(
+                f"{medal}#{rank} <b>{kw_e}</b>\n"
+                f"  <b>Opp: {opp.opportunity_score}/100</b> | {emoji} {opp.status} | WoW: {wow_str}\n"
+                f"  {act_emoji} {ACTION_LABEL_VI[opp.action_label]} — {opp.action_reason}"
+            )
+
+        winner = opportunities[0]
+        if winner.action_label == "GO":
+            lines.append(f"\n\U0001F3C6 Biến thể tốt nhất: <b>{html.escape(winner.keyword)}</b>!")
+        await query.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+    elif action == "t":
+        # Track original keyword anyway
+        await register_user(update.effective_user.id)
+        from signal_radar import detect_domain
+        domain = detect_domain(original)
+        added = await add_keyword(update.effective_user.id, original, domain, geo="VN")
+        if added:
+            await query.message.reply_text(
+                f"\u2705 Đã theo dõi: <b>{html.escape(original)}</b> (bỏ qua gợi ý tinh chỉnh)",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await query.message.reply_text(
+                f"Bạn đã theo dõi <b>{html.escape(original)}</b> rồi.",
+                parse_mode=ParseMode.HTML,
+            )
+
+    # Clean up stored resolution data
+    context.user_data.pop(res_key, None)
 
 
 # Fallback message handler — catches free-text when user pressed "Quét trend" button
@@ -794,6 +1106,129 @@ async def cmd_pdel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"Project <b>{html.escape(project_name)}</b> không tồn tại.",
             parse_mode=ParseMode.HTML,
         )
+
+
+# ---------------------------------------------------------------------------
+# /top command — ranked opportunity feed
+# ---------------------------------------------------------------------------
+
+async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show user's top opportunities ranked by score + quality."""
+    snapshots = await get_latest_user_snapshots(update.effective_user.id)
+
+    if not snapshots:
+        await update.message.reply_text(
+            "\U0001F4CA <b>Top cơ hội</b>\n\n"
+            "Chưa có dữ liệu. Bắt đầu với:\n"
+            "\u2022 /scan — quét từ khóa\n"
+            "\u2022 /track mật ong — theo dõi từ khóa\n"
+            "\u2022 Bot sẽ tự động quét hàng ngày và xếp hạng cơ hội.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Classify into tiers
+    strong_go: list[dict] = []    # score >= 65 and good quality
+    worth_watching: list[dict] = []  # score 35-64 or high score but weak quality
+    weak_noisy: list[dict] = []   # score < 35 or PERSON/AMBIGUOUS
+
+    for snap in snapshots:
+        score = snap.get("opportunity_score") or 0
+        quality = snap.get("keyword_quality_label") or ""
+        geo = snap.get("geo") or "VN"
+
+        if quality in ("PERSON",) or score < 25:
+            weak_noisy.append(snap)
+        elif score >= 65 and quality in ("COMMERCIAL", ""):
+            strong_go.append(snap)
+        elif score >= 35:
+            worth_watching.append(snap)
+        elif quality in ("AMBIGUOUS", "BROAD", "BRAND"):
+            weak_noisy.append(snap)
+        else:
+            worth_watching.append(snap)
+
+    # Sort each tier by opportunity_score descending
+    strong_go.sort(key=lambda s: -(s.get("opportunity_score") or 0))
+    worth_watching.sort(key=lambda s: -(s.get("opportunity_score") or 0))
+    weak_noisy.sort(key=lambda s: -(s.get("opportunity_score") or 0))
+
+    total = len(snapshots)
+    lines = [f"<b>TOP CƠ HỘI</b> ({total} từ khóa)\n"]
+
+    # Quick summary
+    go_count = len(strong_go)
+    watch_count = len(worth_watching)
+    weak_count = len(weak_noisy)
+    lines.append(
+        f"\U0001F7E2 GO mạnh: {go_count} | \U0001F7E1 Đáng xem: {watch_count} | "
+        f"\U0001F534 Yếu/Nhiễu: {weak_count}\n"
+    )
+
+    def _format_snap_item(snap: dict, idx: int) -> str:
+        kw = html.escape(snap["keyword"])
+        score = snap.get("opportunity_score") or 0
+        status = snap.get("status") or "UNKNOWN"
+        geo = snap.get("geo") or "VN"
+        quality = snap.get("keyword_quality_label") or ""
+        wow = snap.get("wow_growth") or 0
+        wow_str = f"{wow:+.0f}%" if wow else "—"
+        conf = snap.get("confidence") or 0
+        emoji = STATUS_EMOJI.get(status, "\U0001F4CA")
+        geo_flag = GEO_FLAGS.get(geo, "\U0001F310")
+        q_badge = _QUALITY_BADGES.get(quality, "")
+
+        # Decision hint
+        if score >= 65 and quality in ("COMMERCIAL", ""):
+            hint = "Hành động ngay"
+        elif quality in ("AMBIGUOUS", "BROAD", "BRAND"):
+            hint = "Cần từ khóa cụ thể hơn"
+        elif quality == "PERSON":
+            hint = "Không phải sản phẩm"
+        elif score >= 35:
+            hint = "Theo dõi sát"
+        else:
+            hint = "Tín hiệu yếu"
+
+        return (
+            f"  {idx}. {geo_flag} {emoji} <b>{kw}</b> [{geo}]\n"
+            f"     Opp: <b>{score:.0f}</b>/100 | WoW: {wow_str} | Conf: {conf}\n"
+            f"     {q_badge} {quality} — {hint}"
+        )
+
+    if strong_go:
+        lines.append(f"\n\U0001F7E2 <b>STRONG GO — Hành động ngay</b>")
+        for i, snap in enumerate(strong_go[:5], 1):
+            lines.append(_format_snap_item(snap, i))
+
+    if worth_watching:
+        lines.append(f"\n\U0001F7E1 <b>WORTH WATCHING — Theo dõi</b>")
+        for i, snap in enumerate(worth_watching[:5], 1):
+            lines.append(_format_snap_item(snap, i))
+
+    if weak_noisy:
+        lines.append(f"\n\U0001F534 <b>WEAK / NOISY — Cần cải thiện</b>")
+        for i, snap in enumerate(weak_noisy[:3], 1):
+            lines.append(_format_snap_item(snap, i))
+
+    # Next action suggestion
+    if strong_go:
+        best = strong_go[0]
+        best_kw = html.escape(best["keyword"])
+        lines.append(
+            f"\n\U0001F449 <b>Tiếp:</b> /compare {best_kw}, [từ khóa 2] — so sánh cơ hội tốt nhất"
+        )
+    elif worth_watching:
+        lines.append("\n\U0001F449 <b>Tiếp:</b> Dùng /scan để tìm từ khóa chất lượng hơn")
+    else:
+        lines.append(
+            "\n\U0001F449 <b>Tiếp:</b> Thử /scan với từ khóa cụ thể hơn "
+            "(thêm loại sản phẩm, thương hiệu)"
+        )
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
 # ---------------------------------------------------------------------------
 
 # Sparkline characters from low to high
@@ -870,9 +1305,30 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         delta = compute_delta(r, prev_row)
         delta_line = f"\n    ↪ {delta}" if delta else ""
 
+        # Multi-source fields (graceful for old rows where these may be 0/empty)
+        opp_score = r.get("opportunity_score") or 0
+        src_count = r.get("source_count") or 0
+        evidence = r.get("evidence_summary") or ""
+        ms_line = ""
+        if opp_score and opp_score > 0:
+            ms_line = f" | Opp: {opp_score:.0f}/100"
+            if src_count and src_count > 1:
+                ms_line += f" | Nguồn: {src_count}/4"
+
+        # Marketplace fields (graceful for old rows)
+        mp_presence = r.get("marketplace_presence_score") or 0
+        mp_intent = r.get("marketplace_intent_score") or 0
+        mp_crowding = r.get("crowding_risk_score") or 0
+        mp_line = ""
+        if mp_presence > 0 or mp_intent > 0:
+            crowd_emoji = "\U0001F7E2" if mp_crowding < 0.3 else ("\U0001F7E1" if mp_crowding < 0.6 else "\U0001F534")
+            mp_line = f"\n    \U0001F6D2 MP: {mp_presence:.0%} presence | {mp_intent:.0%} intent | {crowd_emoji} {mp_crowding:.0%} crowding"
+
+        evidence_line = f"\n    <i>{evidence}</i>" if evidence else ""
+
         lines.append(
             f"{emoji} {date_str} | {status} | WoW: {wow_str} | "
-            f"Int: {interest} | Conf: {conf}{act_line}{delta_line}"
+            f"Int: {interest} | Conf: {conf}{act_line}{ms_line}{delta_line}{mp_line}{evidence_line}"
         )
 
     lines.append(f"\nInterest trend: <code>{spark}</code>")
@@ -906,7 +1362,7 @@ async def cmd_compare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(f"Giới hạn 5 từ khóa. So sánh: {', '.join(keywords)}")
 
     processing_msg = await update.message.reply_text(
-        f"\u23F3 Đang so sánh {len(keywords)} từ khóa... (mất ~{len(keywords) * 5}s)"
+        f"\u23F3 Đang so sánh {len(keywords)} từ khóa (multi-source)... (mất ~{len(keywords) * 8}s)"
     )
 
     config = TrendSignalConfig()
@@ -918,47 +1374,28 @@ async def cmd_compare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    results = await asyncio.to_thread(velocity_engine, interest_df)
+    velocity_df = await asyncio.to_thread(velocity_engine, interest_df)
 
-    if results.empty:
+    if velocity_df.empty:
         await processing_msg.edit_text("Không đủ dữ liệu để phân tích.")
         return
 
-    # Compute action + opportunity score for ranking
-    action_order = {"GO": 0, "WATCH": 1, "AVOID": 2}
-    rows_with_action = []
-    for _, row in results.iterrows():
-        status = str(row["status"])
-        conf = int(row["confidence"])
-        wow = row["wow_growth_pct"]
-        peak = float(row["peak_position_pct"])
-        accel = float(row["acceleration_pct"])
-        consist = float(row["consistency_pct"])
+    # Multi-source enrichment
+    opportunities = await asyncio.to_thread(multi_source_engine, velocity_df, "VN")
 
-        action, reason = compute_action(status, conf, wow, peak, accel, consist)
-        rows_with_action.append((row, action, reason))
+    # Build comparison table ranked by opportunity_score
+    lines = [f"<b>SO SÁNH CƠ HỘI — {len(opportunities)} từ khóa</b>\n"]
 
-    # Sort: GO first, then WATCH, then AVOID; within each by confidence desc
-    rows_with_action.sort(
-        key=lambda x: (action_order.get(x[1], 2), -int(x[0]["confidence"]))
-    )
-
-    # Build comparison table
-    lines = [f"<b>SO SÁNH CƠ HỘI — {len(rows_with_action)} từ khóa</b>\n"]
-    lines.append(f"{'Rank':<5} {'Từ khóa':<20} {'Hành động':<12} {'Status':<12} {'Conf':<6} {'WoW'}")
-    lines.append("\u2500" * 45)
-
-    for rank, (row, action, reason) in enumerate(rows_with_action, 1):
-        kw = html.escape(str(row["keyword"]))
-        status = str(row["status"])
+    for rank, opp in enumerate(opportunities, 1):
+        kw = html.escape(opp.keyword)
+        status = opp.status
         emoji = STATUS_EMOJI.get(status, "\U0001F4CA")
-        act_emoji = ACTION_EMOJI[action]
-        act_vi = ACTION_LABEL_VI[action]
-        conf = int(row["confidence"])
-        wow = row["wow_growth_pct"]
+        act_emoji = ACTION_EMOJI[opp.action_label]
+        act_vi = ACTION_LABEL_VI[opp.action_label]
+        conf = opp.confidence
+        wow = opp.wow_growth_pct
         wow_str = "INF" if wow == float("inf") else f"{wow:+.0f}%"
-        domain = str(row.get("domain", "General"))
-        de = DOMAIN_EMOJI.get(domain, "\U0001F310")
+        de = DOMAIN_EMOJI.get(opp.domain, "\U0001F310")
 
         medal = ""
         if rank == 1:
@@ -970,19 +1407,36 @@ async def cmd_compare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         lines.append(
             f"{medal}<b>#{rank}</b> {de} <b>{kw}</b>\n"
+            f"  <b>Opportunity: {opp.opportunity_score}/100</b> | Nguồn: {opp.source_count}/4\n"
             f"  {act_emoji} <b>{act_vi}</b> | {emoji} {status} | "
             f"WoW: {wow_str} | Conf: {conf}/100\n"
-            f"  {reason}"
+            f"  {opp.action_reason}"
         )
 
+        # Marketplace line if available
+        if opp.marketplace_presence > 0 or opp.marketplace_intent > 0:
+            crowd_emoji = "\U0001F7E2" if opp.crowding_risk < 0.3 else ("\U0001F7E1" if opp.crowding_risk < 0.6 else "\U0001F534")
+            lines.append(
+                f"  \U0001F6D2 MP: {opp.marketplace_presence:.0%} presence | "
+                f"{opp.marketplace_intent:.0%} intent | {crowd_emoji} {opp.crowding_risk:.0%} crowding"
+            )
+
+        # Quality note for weak keywords
+        if opp.resolution and opp.resolution.is_weak:
+            q_badge = _QUALITY_BADGES.get(opp.keyword_quality_label, "\u26A0\uFE0F")
+            lines.append(
+                f"  {q_badge} Từ khóa {opp.keyword_quality_label.lower()} — "
+                f"điểm có thể không phản ánh đúng cơ hội"
+            )
+
     # Winner callout
-    winner_row, winner_action, winner_reason = rows_with_action[0]
-    winner_kw = html.escape(str(winner_row["keyword"]))
-    if winner_action == "GO":
+    winner = opportunities[0]
+    winner_kw = html.escape(winner.keyword)
+    if winner.action_label == "GO":
         lines.append(
-            f"\n\U0001F3C6 <b>Cơ hội tốt nhất:</b> {winner_kw} — HÀNH ĐỘNG!"
+            f"\n\U0001F3C6 <b>Cơ hội tốt nhất:</b> {winner_kw} — Điểm {winner.opportunity_score}/100!"
         )
-    elif winner_action == "WATCH":
+    elif winner.action_label == "WATCH":
         lines.append(
             f"\n\U0001F448 <b>Đáng chú ý nhất:</b> {winner_kw} — Theo dõi sát."
         )
@@ -999,23 +1453,22 @@ async def cmd_compare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ---------------------------------------------------------------------------
 
 async def cmd_suggest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Suggest related keywords using Google Trends related queries."""
+    """Suggest related keywords using multi-source discovery."""
     if not context.args:
         await update.message.reply_text(
             "Dùng: <code>/suggest từ khóa</code>\n"
             "Ví dụ: <code>/suggest mật ong</code>\n\n"
-            "Bot sẽ tìm các từ khóa liên quan đang trending.",
+            "Bot sẽ tìm các từ khóa liên quan từ nhiều nguồn.",
             parse_mode=ParseMode.HTML,
         )
         return
 
     keyword = " ".join(context.args).strip()
     processing_msg = await update.message.reply_text(
-        f"\U0001F50D Đang tìm từ khóa liên quan đến <b>{html.escape(keyword)}</b>..."
+        f"\U0001F50D Đang tìm từ khóa liên quan đến <b>{html.escape(keyword)}</b> (multi-source)..."
     )
 
-    config = TrendSignalConfig()
-    suggestions = await asyncio.to_thread(fetch_suggestions, keyword, config)
+    suggestions = await asyncio.to_thread(fetch_multi_source_suggestions, keyword, "VN")
 
     if not suggestions:
         await processing_msg.edit_text(
@@ -1027,8 +1480,17 @@ async def cmd_suggest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     lines = [f"<b>Gợi ý — {html.escape(keyword)}</b>\n"]
 
+    # Group by source type
+    autocomplete = [s for s in suggestions if s["type"] == "autocomplete"]
     rising = [s for s in suggestions if s["type"] == "rising"]
     top = [s for s in suggestions if s["type"] == "top"]
+    commercial = [s for s in suggestions if s["type"] == "commercial"]
+
+    if autocomplete:
+        lines.append("\U0001F4F1 <b>Autocomplete gợi ý:</b>")
+        for s in autocomplete[:5]:
+            lines.append(f"  \u2022 {html.escape(s['keyword'])}")
+        lines.append("")
 
     if rising:
         lines.append("\U0001F525 <b>Đang tăng:</b>")
@@ -1046,6 +1508,12 @@ async def cmd_suggest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             val = html.escape(s["value"]) if s["value"] else ""
             val_str = f" ({val})" if val else ""
             lines.append(f"  \u2022 {kw}{val_str}")
+        lines.append("")
+
+    if commercial:
+        lines.append("\U0001F6D2 <b>Biến thể thương mại:</b>")
+        for s in commercial:
+            lines.append(f"  \u2022 {html.escape(s['keyword'])}")
 
     lines.append(f"\n\u2022 Dùng <code>/track từ khóa</code> để theo dõi")
     lines.append(f"\u2022 Dùng <code>/compare {html.escape(keyword)}, từ_khóa_2</code> để so sánh")
@@ -1076,7 +1544,7 @@ async def _daily_scan(context: ContextTypes.DEFAULT_TYPE, keywords_override: lis
         geo_groups.setdefault(geo, []).append(kw)
 
     # Process each geo separately
-    all_results: list[tuple[dict, dict, str]] = []  # (row, tracked, geo)
+    all_results: list[tuple[OpportunityResult, dict, str]] = []  # (opp, tracked, geo)
 
     for geo, geo_keywords in geo_groups.items():
         config = make_geo_config(geo)
@@ -1087,46 +1555,32 @@ async def _daily_scan(context: ContextTypes.DEFAULT_TYPE, keywords_override: lis
             print(f"[TRACKER] No data for geo={geo} — skipping.")
             continue
 
-        results = await asyncio.to_thread(velocity_engine, interest_df)
-        if results.empty:
+        velocity_df = await asyncio.to_thread(velocity_engine, interest_df)
+        if velocity_df.empty:
             print(f"[TRACKER] Velocity engine empty for geo={geo} — skipping.")
             continue
 
-        result_map = {str(row["keyword"]): row for _, row in results.iterrows()}
-
-        # Compute action labels
-        for kw_name, row in result_map.items():
-            status = str(row["status"])
-            conf = int(row["confidence"])
-            wow = row["wow_growth_pct"]
-            peak = float(row["peak_position_pct"])
-            accel = float(row["acceleration_pct"])
-            consist = float(row["consistency_pct"])
-            action_map_key = (kw_name, geo)
-            # Store in result_map row
-            row["_action"] = compute_action(status, conf, wow, peak, accel, consist)
+        # Multi-source enrichment
+        opportunities = await asyncio.to_thread(multi_source_engine, velocity_df, geo)
+        opp_map = {o.keyword: o for o in opportunities}
 
         for tracked in geo_keywords:
-            row = result_map.get(tracked["keyword"])
-            if row is None:
+            opp = opp_map.get(tracked["keyword"])
+            if opp is None:
                 continue
-            all_results.append((dict(row), tracked, geo))
+            all_results.append((opp, tracked, geo))
 
     if not all_results:
         print("[TRACKER] No results across all geos — skipping.")
         return
 
     # ---- Phase 1: Save history + update tracked_keywords ----
-    for row, tracked, geo in all_results:
-        new_status = str(row["status"])
-        wow = float(row["wow_growth_pct"]) if row["wow_growth_pct"] != float("inf") else 999.0
-        conf = int(row["confidence"])
-        domain = str(row.get("domain", tracked.get("domain") or "General"))
-        interest = float(row["interest"])
-        accel = float(row["acceleration_pct"])
-        consistency = float(row["consistency_pct"])
-        peak = float(row["peak_position_pct"])
-        action, reason = row.get("_action", ("WATCH", ""))
+    for opp, tracked, geo in all_results:
+        new_status = opp.status
+        wow = 999.0 if opp.wow_growth_pct == float("inf") else float(opp.wow_growth_pct)
+        conf = opp.confidence
+        domain = opp.domain
+        interest = opp.interest
 
         await insert_scan_history(
             keyword=tracked["keyword"],
@@ -1136,12 +1590,24 @@ async def _daily_scan(context: ContextTypes.DEFAULT_TYPE, keywords_override: lis
             wow_growth=wow,
             confidence=conf,
             interest=interest,
-            acceleration=accel,
-            consistency=consistency,
-            peak_position=peak,
-            action_label=action,
-            action_reason=reason,
+            acceleration=opp.acceleration_pct,
+            consistency=opp.consistency_pct,
+            peak_position=opp.peak_position_pct,
+            action_label=opp.action_label,
+            action_reason=opp.action_reason,
             geo=geo,
+            opportunity_score=opp.opportunity_score,
+            source_count=opp.source_count,
+            source_agreement=opp.source_agreement,
+            keyword_quality_label=opp.keyword_quality_label,
+            evidence_summary=opp.evidence_summary,
+            marketplace_presence_score=opp.marketplace_presence,
+            marketplace_intent_score=opp.marketplace_intent,
+            crowding_risk_score=opp.crowding_risk,
+            normalized_keyword=opp.normalized_keyword,
+            ambiguity_score=opp.resolution.ambiguity_score if opp.resolution else 0.0,
+            commercial_intent_score=opp.resolution.commercial_intent_score if opp.resolution else 0.0,
+            resolver_reason=opp.resolution.resolver_reason if opp.resolution else "",
         )
 
         await update_keyword_status(
@@ -1155,17 +1621,18 @@ async def _daily_scan(context: ContextTypes.DEFAULT_TYPE, keywords_override: lis
     # ---- Phase 2: Immediate BURSTING alerts (with noise reduction) ----
     _ALERT_COOLDOWN_HOURS = 24
 
-    for row, tracked, geo in all_results:
-        new_status = str(row["status"])
+    for opp, tracked, geo in all_results:
+        new_status = opp.status
         old_status = tracked.get("last_status") or "UNKNOWN"
-        action, reason = row.get("_action", ("WATCH", ""))
+        action = opp.action_label
+        reason = opp.action_reason
 
         # Noise reduction: only alert on status transition to BURSTING/EMERGING
         if new_status not in {"BURSTING", "EMERGING"} or old_status == new_status:
             continue
 
         # Noise reduction: must be GO or high confidence
-        conf = int(row["confidence"])
+        conf = opp.confidence
         if action != "GO" and conf < 30:
             continue
 
@@ -1180,8 +1647,8 @@ async def _daily_scan(context: ContextTypes.DEFAULT_TYPE, keywords_override: lis
             except (ValueError, TypeError):
                 pass
 
-        domain = str(row.get("domain", tracked.get("domain") or "General"))
-        wow = float(row["wow_growth_pct"]) if row["wow_growth_pct"] != float("inf") else 999.0
+        domain = opp.domain
+        wow = 999.0 if opp.wow_growth_pct == float("inf") else float(opp.wow_growth_pct)
         de = DOMAIN_EMOJI.get(domain, "\U0001F310")
         rec = get_recommendation(domain, new_status)
         act_emoji = ACTION_EMOJI[action]
@@ -1190,7 +1657,7 @@ async def _daily_scan(context: ContextTypes.DEFAULT_TYPE, keywords_override: lis
 
         delta = compute_delta(
             {"status": new_status, "confidence": conf, "wow_growth": wow,
-             "interest": float(row["interest"])},
+             "interest": opp.interest},
             {"status": old_status, "confidence": tracked.get("last_confidence") or 0,
              "wow_growth": tracked.get("last_wow_growth") or 0, "interest": 0},
         )
@@ -1200,7 +1667,7 @@ async def _daily_scan(context: ContextTypes.DEFAULT_TYPE, keywords_override: lis
             f"<b>\U0001F6A8 {new_status} ALERT \U0001F6A8</b>\n\n"
             f"<b>{html.escape(tracked['keyword'])}</b> {geo_flag} {geo} {de} {domain}\n"
             f"Trạng thái: {old_status} → <b>{new_status}</b>\n"
-            f"Wow: +{wow:.1f}% | Confidence: {conf}/100\n"
+            f"Wow: +{wow:.1f}% | Confidence: {conf}/100 | Opportunity: {opp.opportunity_score}/100\n"
             f"{act_emoji} <b>{act_vi}</b> — {reason}{delta_line}\n"
             f"→ <b>{rec}</b>"
         )
@@ -1219,7 +1686,7 @@ async def _daily_scan(context: ContextTypes.DEFAULT_TYPE, keywords_override: lis
     user_chat_ids = list({kw["chat_id"] for kw in all_keywords}) if keywords_override is None else list({t["chat_id"] for _, t, _ in all_results})
 
     for chat_id in user_chat_ids:
-        user_items = [(r, t, g) for r, t, g in all_results if t["chat_id"] == chat_id]
+        user_items = [(o, t, g) for o, t, g in all_results if t["chat_id"] == chat_id]
 
         if not user_items:
             continue
@@ -1229,21 +1696,19 @@ async def _daily_scan(context: ContextTypes.DEFAULT_TYPE, keywords_override: lis
         watch_items: list[tuple] = []
         avoid_items: list[tuple] = []
 
-        for row, tracked, geo in user_items:
-            action, reason = row.get("_action", ("WATCH", ""))
-
+        for opp, tracked, geo in user_items:
             delta = compute_delta(
-                {"status": str(row["status"]), "confidence": int(row["confidence"]),
-                 "wow_growth": row["wow_growth_pct"], "interest": float(row["interest"])},
+                {"status": opp.status, "confidence": opp.confidence,
+                 "wow_growth": opp.wow_growth_pct, "interest": opp.interest},
                 {"status": tracked.get("last_status") or "UNKNOWN",
                  "confidence": tracked.get("last_confidence") or 0,
                  "wow_growth": tracked.get("last_wow_growth") or 0, "interest": 0},
             )
 
-            entry = (row, action, reason, delta, geo)
-            if action == "GO":
+            entry = (opp, opp.action_label, opp.action_reason, delta, geo)
+            if opp.action_label == "GO":
                 go_items.append(entry)
-            elif action == "AVOID":
+            elif opp.action_label == "AVOID":
                 avoid_items.append(entry)
             else:
                 watch_items.append(entry)
@@ -1258,16 +1723,16 @@ async def _daily_scan(context: ContextTypes.DEFAULT_TYPE, keywords_override: lis
             parts.append(f"{len(avoid_items)} tín hiệu đang yếu đi")
         takeaway = "Hôm nay có " + ", ".join(parts) + "." if parts else "Không có thay đổi đáng chú ý."
 
-        # Hottest keyword by geo
-        all_sorted = sorted(user_items, key=lambda x: -int(x[0]["confidence"]))
+        # Hottest keyword by opportunity score
+        all_sorted = sorted(user_items, key=lambda x: -x[0].opportunity_score)
         hottest = all_sorted[0] if all_sorted else None
         hottest_line = ""
         if hottest:
-            h_row, _, h_geo = hottest
+            h_opp, _, h_geo = hottest
             h_flag = GEO_FLAGS.get(h_geo, "\U0001F310")
             hottest_line = (
-                f"\U0001F525 Hot nhất: <b>{html.escape(str(h_row['keyword']))}</b> {h_flag} {h_geo} "
-                f"(Conf: {int(h_row['confidence'])})"
+                f"\U0001F525 Hot nhất: <b>{html.escape(h_opp.keyword)}</b> {h_flag} {h_geo} "
+                f"(Opp: {h_opp.opportunity_score}/100)"
             )
 
         lines = [f"<b>BÁO CÁO HÀNG NGÀY</b>\n"]
@@ -1278,24 +1743,24 @@ async def _daily_scan(context: ContextTypes.DEFAULT_TYPE, keywords_override: lis
         def _format_section(title: str, emoji: str, items: list[tuple]) -> None:
             if not items:
                 return
-            items.sort(key=lambda x: -int(x[0]["confidence"]))
+            items.sort(key=lambda x: -x[0].opportunity_score)
             lines.append(f"{emoji} <b>{title}</b>")
-            for row, action, reason, delta, geo in items:
-                status = str(row["status"])
-                domain = str(row.get("domain", "General"))
+            for opp, action, reason, delta, geo in items:
+                status = opp.status
+                domain = opp.domain
                 s_emoji = STATUS_EMOJI.get(status, "\U0001F4CA")
                 de = DOMAIN_EMOJI.get(domain, "\U0001F310")
-                kw = html.escape(str(row["keyword"]))
-                wow = row["wow_growth_pct"]
+                kw = html.escape(opp.keyword)
+                wow = opp.wow_growth_pct
                 wow_str = "INF" if wow == float("inf") else f"{wow:+.1f}"
-                conf = int(row["confidence"])
-                interest = int(round(float(row["interest"])))
+                conf = opp.confidence
+                interest = int(round(opp.interest))
                 geo_flag = GEO_FLAGS.get(geo, "\U0001F310")
                 delta_line = f"\n  ↪ {delta}" if delta else ""
 
                 lines.append(
                     f"  {geo_flag} {de} <b>{kw}</b> [{geo}]\n"
-                    f"  {s_emoji} {status} | Int: {interest} | WoW: {wow_str}% | Conf: {conf}\n"
+                    f"  {s_emoji} {status} | Opp: {opp.opportunity_score}/100 | WoW: {wow_str}% | Conf: {conf}\n"
                     f"  {reason}{delta_line}"
                 )
             lines.append("")
@@ -1442,11 +1907,13 @@ def main() -> None:
     application.add_handler(CommandHandler("compare", cmd_compare))
     application.add_handler(CommandHandler("suggest", cmd_suggest))
     application.add_handler(CommandHandler("export", cmd_export))
+    application.add_handler(CommandHandler("top", cmd_top))
     application.add_handler(CommandHandler("pnew", cmd_pnew))
     application.add_handler(CommandHandler("plist", cmd_plist))
     application.add_handler(CommandHandler("padd", cmd_padd))
     application.add_handler(CommandHandler("pview", cmd_pview))
     application.add_handler(CommandHandler("pdel", cmd_pdel))
+    application.add_handler(CallbackQueryHandler(resolve_callback, pattern=r"^res:"))
     application.add_handler(CallbackQueryHandler(button_callback))
 
     # Catch free-text when user clicked the inline button (not in /scan conversation)

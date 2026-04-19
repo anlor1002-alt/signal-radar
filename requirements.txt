@@ -5,4 +5,5 @@ numpy
 python-dotenv==1.2.2
 urllib3<2
 aiosqlite
+requests>=2.28
 

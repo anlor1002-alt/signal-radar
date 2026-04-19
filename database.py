@@ -80,6 +80,21 @@ _MIGRATIONS = [
     "ALTER TABLE scan_history ADD COLUMN action_reason TEXT DEFAULT ''",
     "ALTER TABLE scan_history ADD COLUMN geo TEXT DEFAULT 'VN'",
     "ALTER TABLE tracked_keywords ADD COLUMN last_alert_at TEXT DEFAULT NULL",
+    # Multi-source opportunity engine columns
+    "ALTER TABLE scan_history ADD COLUMN opportunity_score REAL DEFAULT 0.0",
+    "ALTER TABLE scan_history ADD COLUMN source_count INTEGER DEFAULT 1",
+    "ALTER TABLE scan_history ADD COLUMN source_agreement REAL DEFAULT 0.0",
+    "ALTER TABLE scan_history ADD COLUMN keyword_quality_label TEXT DEFAULT ''",
+    "ALTER TABLE scan_history ADD COLUMN evidence_summary TEXT DEFAULT ''",
+    # Marketplace validation columns
+    "ALTER TABLE scan_history ADD COLUMN marketplace_presence_score REAL DEFAULT 0.0",
+    "ALTER TABLE scan_history ADD COLUMN marketplace_intent_score REAL DEFAULT 0.0",
+    "ALTER TABLE scan_history ADD COLUMN crowding_risk_score REAL DEFAULT 0.0",
+    "ALTER TABLE scan_history ADD COLUMN normalized_keyword TEXT DEFAULT ''",
+    # Resolver columns
+    "ALTER TABLE scan_history ADD COLUMN ambiguity_score REAL DEFAULT 0.0",
+    "ALTER TABLE scan_history ADD COLUMN commercial_intent_score REAL DEFAULT 0.0",
+    "ALTER TABLE scan_history ADD COLUMN resolver_reason TEXT DEFAULT ''",
 ]
 
 
@@ -414,6 +429,18 @@ async def insert_scan_history(
     action_label: str = "",
     action_reason: str = "",
     geo: str = "VN",
+    opportunity_score: float = 0.0,
+    source_count: int = 1,
+    source_agreement: float = 0.0,
+    keyword_quality_label: str = "",
+    evidence_summary: str = "",
+    marketplace_presence_score: float = 0.0,
+    marketplace_intent_score: float = 0.0,
+    crowding_risk_score: float = 0.0,
+    normalized_keyword: str = "",
+    ambiguity_score: float = 0.0,
+    commercial_intent_score: float = 0.0,
+    resolver_reason: str = "",
 ) -> None:
     """Save a snapshot of a keyword scan into history."""
     chat_id = str(chat_id)
@@ -423,11 +450,19 @@ async def insert_scan_history(
             "INSERT INTO scan_history "
             "(keyword, chat_id, geo, domain, status, wow_growth, confidence, "
             " interest, acceleration, consistency, peak_position, "
-            " action_label, action_reason, scanned_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " action_label, action_reason, opportunity_score, source_count, "
+            " source_agreement, keyword_quality_label, evidence_summary, "
+            " marketplace_presence_score, marketplace_intent_score, "
+            " crowding_risk_score, normalized_keyword, "
+            " ambiguity_score, commercial_intent_score, resolver_reason, scanned_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (keyword, chat_id, geo, domain, status, wow_growth, confidence,
              interest, acceleration, consistency, peak_position,
-             action_label, action_reason, now),
+             action_label, action_reason, opportunity_score, source_count,
+             source_agreement, keyword_quality_label, evidence_summary,
+             marketplace_presence_score, marketplace_intent_score,
+             crowding_risk_score, normalized_keyword,
+             ambiguity_score, commercial_intent_score, resolver_reason, now),
         )
         await db.commit()
 
@@ -446,7 +481,12 @@ async def get_keyword_history(
             cursor = await db.execute(
                 "SELECT status, wow_growth, confidence, interest, "
                 " acceleration, consistency, peak_position, "
-                " action_label, action_reason, geo, scanned_at "
+                " action_label, action_reason, geo, scanned_at, "
+                " opportunity_score, source_count, source_agreement, "
+                " keyword_quality_label, evidence_summary, "
+                " marketplace_presence_score, marketplace_intent_score, "
+                " crowding_risk_score, normalized_keyword, "
+                " ambiguity_score, commercial_intent_score, resolver_reason "
                 "FROM scan_history "
                 "WHERE chat_id = ? AND keyword = ? AND geo = ? "
                 "ORDER BY scanned_at DESC LIMIT ?",
@@ -456,7 +496,12 @@ async def get_keyword_history(
             cursor = await db.execute(
                 "SELECT status, wow_growth, confidence, interest, "
                 " acceleration, consistency, peak_position, "
-                " action_label, action_reason, geo, scanned_at "
+                " action_label, action_reason, geo, scanned_at, "
+                " opportunity_score, source_count, source_agreement, "
+                " keyword_quality_label, evidence_summary, "
+                " marketplace_presence_score, marketplace_intent_score, "
+                " crowding_risk_score, normalized_keyword, "
+                " ambiguity_score, commercial_intent_score, resolver_reason "
                 "FROM scan_history "
                 "WHERE chat_id = ? AND keyword = ? "
                 "ORDER BY scanned_at DESC LIMIT ?",
@@ -474,7 +519,12 @@ async def get_latest_user_snapshots(chat_id: int | str) -> list[dict]:
         cursor = await db.execute(
             "SELECT sh.keyword, sh.geo, sh.domain, sh.status, sh.wow_growth, "
             " sh.confidence, sh.interest, sh.acceleration, "
-            " sh.consistency, sh.peak_position, sh.scanned_at "
+            " sh.consistency, sh.peak_position, sh.scanned_at, "
+            " sh.opportunity_score, sh.source_count, sh.source_agreement, "
+            " sh.keyword_quality_label, sh.evidence_summary, "
+            " sh.marketplace_presence_score, sh.marketplace_intent_score, "
+            " sh.crowding_risk_score, sh.normalized_keyword, "
+            " sh.ambiguity_score, sh.commercial_intent_score, sh.resolver_reason "
             "FROM scan_history sh "
             "INNER JOIN ("
             "  SELECT keyword, geo, MAX(scanned_at) AS max_at "
@@ -539,7 +589,12 @@ async def export_user_history_csv(
             cursor = await db.execute(
                 "SELECT keyword, geo, domain, status, wow_growth, confidence, "
                 "interest, acceleration, consistency, peak_position, "
-                "action_label, action_reason, scanned_at "
+                "action_label, action_reason, scanned_at, "
+                "opportunity_score, source_count, source_agreement, "
+                "keyword_quality_label, evidence_summary, "
+                "marketplace_presence_score, marketplace_intent_score, "
+                "crowding_risk_score, normalized_keyword, "
+                "ambiguity_score, commercial_intent_score, resolver_reason "
                 "FROM scan_history WHERE chat_id = ? AND keyword = ? "
                 "ORDER BY scanned_at DESC",
                 (chat_id, keyword),
@@ -548,7 +603,12 @@ async def export_user_history_csv(
             cursor = await db.execute(
                 "SELECT sh.keyword, sh.geo, sh.domain, sh.status, sh.wow_growth, "
                 "sh.confidence, sh.interest, sh.acceleration, sh.consistency, "
-                "sh.peak_position, sh.action_label, sh.action_reason, sh.scanned_at "
+                "sh.peak_position, sh.action_label, sh.action_reason, sh.scanned_at, "
+                "sh.opportunity_score, sh.source_count, sh.source_agreement, "
+                "sh.keyword_quality_label, sh.evidence_summary, "
+                "sh.marketplace_presence_score, sh.marketplace_intent_score, "
+                "sh.crowding_risk_score, sh.normalized_keyword, "
+                "sh.ambiguity_score, sh.commercial_intent_score, sh.resolver_reason "
                 "FROM scan_history sh "
                 "INNER JOIN tracked_keywords tk ON sh.keyword = tk.keyword AND sh.geo = tk.geo "
                 "INNER JOIN projects p ON tk.project_id = p.id "
@@ -560,7 +620,12 @@ async def export_user_history_csv(
             cursor = await db.execute(
                 "SELECT keyword, geo, domain, status, wow_growth, confidence, "
                 "interest, acceleration, consistency, peak_position, "
-                "action_label, action_reason, scanned_at "
+                "action_label, action_reason, scanned_at, "
+                "opportunity_score, source_count, source_agreement, "
+                "keyword_quality_label, evidence_summary, "
+                "marketplace_presence_score, marketplace_intent_score, "
+                "crowding_risk_score, normalized_keyword, "
+                "ambiguity_score, commercial_intent_score, resolver_reason "
                 "FROM scan_history WHERE chat_id = ? "
                 "ORDER BY scanned_at DESC",
                 (chat_id,),

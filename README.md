@@ -90,12 +90,71 @@ E-commerce, Fashion, Health & Beauty, Technology, Finance, Entertainment, Educat
 ## Architecture
 
 ```
-signal_radar.py   — Core engine (trend fetching, velocity analysis, action labels, geo configs, suggestions)
-bot.py            — Telegram bot (commands, projects, background tracker, digest)
-database.py       — SQLite layer (aiosqlite) with auto-migration
-run.py            — Entry point for Hugging Face Spaces
-Dockerfile        — Container config (port 7860)
+sources.py         — Multi-source engine (autocomplete, news RSS, marketplace, keyword quality, consensus scorer)
+signal_radar.py    — Core engine (trend fetching, velocity analysis, action labels, geo configs, suggestions)
+bot.py             — Telegram bot (commands, projects, background tracker, digest)
+database.py        — SQLite layer (aiosqlite) with auto-migration
+run.py             — Entry point for Hugging Face Spaces
+Dockerfile         — Container config (port 7860)
 ```
+
+### Multi-Source Intelligence
+
+Signal Radar combines **4 evidence layers** to produce a consensus-based opportunity score:
+
+| Source | Method | What it measures |
+|--------|--------|------------------|
+| Google Trends | pytrends interest_over_time | Demand velocity, WoW growth, acceleration |
+| Google Autocomplete | suggestqueries endpoint | Keyword relevance, commercial variants, adjacent demand |
+| Google News RSS | news.google.com/rss/search | Media buzz, article count, headline detection |
+| Shopee VN | search_hint API | Marketplace presence, buyer intent, crowding risk |
+
+**Keyword Quality Analysis** runs before scoring and detects:
+- BRAND keywords (shopee, samsung...)
+- BROAD/generic keywords (mua, bán...)
+- COMMERCIAL intent (product modifiers: tinh, mật, bột, serum...)
+- AMBIGUOUS keywords (single words, person names)
+
+### Marketplace Validation (Shopee VN)
+
+Marketplace confirmation turns search buzz into **commercial opportunity**. The Shopee adapter measures:
+
+| Metric | What it means | How it's scored |
+|--------|---------------|-----------------|
+| Marketplace Presence | Is this keyword already a product category on Shopee? | Exact keyword match in search hints → 0.6-1.0 |
+| Buyer Intent | Do hints contain commercial modifiers (giá, mua, tốt nhất)? | Commerce modifier ratio in hint list |
+| Crowding Risk | How saturated is the market? | Hint count: 12+ = 0.7, 6+ = 0.4, else 0.2 |
+
+**Source weighting**: Not all sources are equal. Weights reflect commercial signal reliability:
+- `shopee = 1.2` — marketplace confirmation is strongest commercial signal
+- `google_trends = 1.0` — baseline demand
+- `autocomplete = 0.8` — adjacent demand signal
+- `news = 0.5` (reduced to 0.2 for BROAD/BRAND/AMBIGUOUS keywords)
+
+**Marketplace absence penalty**: If search buzz is high but Shopee finds no matching products, opportunity score is reduced by 15% — the demand may not be commercially actionable.
+
+Currently supports **VN geo only**. Keywords are normalized (Vietnamese diacritic-aware) before querying Shopee.
+
+**Opportunity Score (0-100)** combines:
+
+| Component | Weight | Source |
+|-----------|--------|--------|
+| Demand score | 20 pts | Weighted avg of all source scores (source-weighted) |
+| Acceleration | 15 pts | WoW growth (capped 300%) |
+| Cross-source agreement | 10 pts | Std dev of source scores |
+| Commercial intent | 10 pts | Keyword quality analyzer |
+| Stability | 10 pts | Consistency % from velocity engine |
+| Confidence | 5 pts | Existing confidence score |
+| Marketplace presence | 15 pts | Shopee search hint presence |
+| Marketplace intent | 10 pts | Shopee commercial modifier ratio |
+| Ambiguity penalty | -8 pts | Keyword quality ambiguity |
+| Crowding risk | -12 pts | Marketplace saturation |
+
+Source count modifiers: 4/4 = +5%, 3/4 = -5%, 2/4 = -10%, 1/4 = -15%
+
+Action thresholds: **65+ = GO**, **35-64 = WATCH**, **0-34 = AVOID**
+
+**Graceful degradation**: If a source fails (timeout, rate limit), the engine continues with remaining sources. Confidence is lowered and evidence summary explains the limitation. Shopee adapter only runs for VN geo — other markets skip marketplace validation gracefully.
 
 ### Background Scanner
 
@@ -153,3 +212,4 @@ git push space main
 - pandas, numpy
 - aiosqlite
 - python-dotenv
+- requests (for autocomplete + news RSS source adapters)
