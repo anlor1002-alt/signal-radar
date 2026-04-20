@@ -441,11 +441,37 @@ async def insert_scan_history(
     ambiguity_score: float = 0.0,
     commercial_intent_score: float = 0.0,
     resolver_reason: str = "",
+    dedup_minutes: int = 0,
 ) -> None:
-    """Save a snapshot of a keyword scan into history."""
+    """Save a snapshot of a keyword scan into history.
+
+    If dedup_minutes > 0, skip insert when a very similar row exists
+    for the same user+normalized_keyword+geo within that many minutes.
+    """
     chat_id = str(chat_id)
     now = datetime.utcnow().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
+        # Dedup check: skip near-duplicate rows within the time window
+        if dedup_minutes > 0 and normalized_keyword:
+            cursor = await db.execute(
+                "SELECT opportunity_score, status FROM scan_history "
+                "WHERE chat_id = ? AND normalized_keyword = ? AND geo = ? "
+                "ORDER BY scanned_at DESC LIMIT 1",
+                (chat_id, normalized_keyword, geo),
+            )
+            recent = await cursor.fetchone()
+            if recent is not None:
+                recent_score = recent[0]
+                recent_status = recent[1]
+                score_similar = abs(recent_score - opportunity_score) < 3
+                status_same = recent_status == status
+                if score_similar and status_same:
+                    print(
+                        f"[DB DEDUP] Skipping duplicate: kw={normalized_keyword} "
+                        f"geo={geo} score={opportunity_score:.0f} (recent={recent_score:.0f})"
+                    )
+                    return
+
         await db.execute(
             "INSERT INTO scan_history "
             "(keyword, chat_id, geo, domain, status, wow_growth, confidence, "
@@ -504,6 +530,54 @@ async def get_keyword_history(
                 " ambiguity_score, commercial_intent_score, resolver_reason "
                 "FROM scan_history "
                 "WHERE chat_id = ? AND keyword = ? "
+                "ORDER BY scanned_at DESC LIMIT ?",
+                (chat_id, keyword, limit),
+            )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_keyword_history_normalized(
+    chat_id: int | str,
+    keyword: str,
+    limit: int = 7,
+    geo: str | None = None,
+) -> list[dict]:
+    """Fallback lookup using normalized_keyword column.
+
+    Tries to find history when the user's input keyword doesn't exactly match
+    the stored keyword (e.g. "Mật Ong" vs "mật ong").
+    """
+    chat_id = str(chat_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if geo:
+            cursor = await db.execute(
+                "SELECT status, wow_growth, confidence, interest, "
+                " acceleration, consistency, peak_position, "
+                " action_label, action_reason, geo, keyword, scanned_at, "
+                " opportunity_score, source_count, source_agreement, "
+                " keyword_quality_label, evidence_summary, "
+                " marketplace_presence_score, marketplace_intent_score, "
+                " crowding_risk_score, normalized_keyword, "
+                " ambiguity_score, commercial_intent_score, resolver_reason "
+                "FROM scan_history "
+                "WHERE chat_id = ? AND normalized_keyword = ? AND geo = ? "
+                "ORDER BY scanned_at DESC LIMIT ?",
+                (chat_id, keyword, geo, limit),
+            )
+        else:
+            cursor = await db.execute(
+                "SELECT status, wow_growth, confidence, interest, "
+                " acceleration, consistency, peak_position, "
+                " action_label, action_reason, geo, keyword, scanned_at, "
+                " opportunity_score, source_count, source_agreement, "
+                " keyword_quality_label, evidence_summary, "
+                " marketplace_presence_score, marketplace_intent_score, "
+                " crowding_risk_score, normalized_keyword, "
+                " ambiguity_score, commercial_intent_score, resolver_reason "
+                "FROM scan_history "
+                "WHERE chat_id = ? AND normalized_keyword = ? "
                 "ORDER BY scanned_at DESC LIMIT ?",
                 (chat_id, keyword, limit),
             )

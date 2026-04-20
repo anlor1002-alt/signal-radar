@@ -59,6 +59,7 @@ Same keyword in different geos = distinct tracked items.
 | `/untrack <kw> [VN\|US\|WW]` | Remove from tracking |
 | `/mylist` | All tracked keywords with GO/WATCH/AVOID + geo flags |
 | `/history <kw>` | 10-day history with sparkline + delta explanations |
+| `/history` | Pick from tracked keywords (inline picker) |
 | `/compare kw1, kw2, kw3` | Compare 2-5 keywords, ranked by opportunity |
 | `/suggest <kw>` | Discover related trending keywords |
 | `/export <kw\|project name\|all>` | Export scan history as CSV |
@@ -178,6 +179,14 @@ Every digest and `/history` includes delta explanations:
 - Status transitions (e.g., RISING → EMERGING)
 - WoW acceleration or cooling
 - Interest trend direction
+
+### UX & Reliability
+
+- Interactive menus (start, history picker) have "Đóng" buttons that clean up inline keyboards
+- Old inline buttons show an expiry notice if tapped after a bot restart
+- Repeated scans of the same keyword within 5 minutes are deduplicated (similar score + same status)
+- `/history` without arguments opens an inline picker of tracked keywords
+- History lookup falls back to normalized keyword matching if exact match fails
 
 ## Setup
 

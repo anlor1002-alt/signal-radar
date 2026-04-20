@@ -58,6 +58,7 @@ from database import (
     get_all_tracked_keywords,
     get_keywords_for_project_ids,
     get_keyword_history,
+    get_keyword_history_normalized,
     get_last_alert_time,
     get_project,
     get_project_keywords,
@@ -102,6 +103,118 @@ DOMAIN_EMOJI = {
     "Education":       "\U0001F4DA",
     "General":         "\U0001F310",
 }
+
+
+# ---------------------------------------------------------------------------
+# Telegram Message Cleanup & Callback Token Helpers
+# ---------------------------------------------------------------------------
+
+async def safe_edit_message(message, text: str, **kwargs) -> None:
+    """Edit a message safely — ignores already-deleted or unchanged."""
+    try:
+        await message.edit_text(text, **kwargs)
+    except Exception:
+        pass
+
+
+async def safe_delete_message(bot, chat_id, message_id) -> None:
+    """Delete a message safely — ignores already-deleted."""
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
+
+
+async def close_callback(query) -> None:
+    """Close an inline UI message: edit to short text, remove keyboard."""
+    try:
+        await query.message.edit_text(
+            "Đã đóng.", parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+
+
+# --- Callback token registry (avoids putting raw text in callback_data) ---
+# Stores keyword/geo payloads under short IDs like "0", "1", "2" in user_data.
+# Tokens survive across the session but expire on bot restart (acceptable).
+
+
+def _cb_token(context: ContextTypes.DEFAULT_TYPE, data: dict) -> str:
+    """Store payload in session token map, return short ID for callback_data."""
+    tokens: dict = context.user_data.setdefault("_cb_tokens", {})
+    # Find next available ID
+    idx = len(tokens)
+    key = str(idx)
+    tokens[key] = data
+    print(f"[CB_TOKEN] Created token {key}: {data}")
+    return key
+
+
+def _cb_resolve(context: ContextTypes.DEFAULT_TYPE, token: str) -> dict | None:
+    """Retrieve payload by token. Returns None if expired (restart)."""
+    tokens: dict = context.user_data.get("_cb_tokens", {})
+    data = tokens.get(token)
+    if data is None:
+        print(f"[CB_TOKEN] Token {token} expired or unknown")
+    return data
+
+
+# --- Typed UI state management ---
+# Tracks interactive bot messages so they can be cleaned up on next view.
+# Types: "menu", "picker", "result", "history"
+
+
+def _remember_ui(
+    context: ContextTypes.DEFAULT_TYPE,
+    message,
+    ui_type: str = "menu",
+) -> None:
+    """Store the current interactive UI message with its type."""
+    context.user_data["_ui_state"] = {
+        "chat_id": message.chat_id,
+        "message_id": message.message_id,
+        "ui_type": ui_type,
+    }
+
+
+async def _cleanup_prev_ui(
+    context: ContextTypes.DEFAULT_TYPE,
+    replace_type: str | None = None,
+) -> None:
+    """Delete the previous interactive UI message if it exists.
+
+    If replace_type is set, only clean up if the previous UI was of that type.
+    If None, always clean up.
+    """
+    state = context.user_data.pop("_ui_state", None)
+    if not state:
+        return
+    if replace_type and state.get("ui_type") != replace_type:
+        # Put it back — wrong type to clean up
+        context.user_data["_ui_state"] = state
+        return
+    await safe_delete_message(context.bot, state["chat_id"], state["message_id"])
+    print(f"[UI] Cleaned up {state.get('ui_type')} message {state['message_id']}")
+
+
+async def _expired_callback(query) -> None:
+    """Handle a callback whose session state has expired (after restart)."""
+    try:
+        await query.answer("Phiên cũ đã hết hạn.")
+    except Exception:
+        pass
+    try:
+        await query.message.edit_text(
+            "\u26A0 Phiên thao tác cũ đã hết hạn.\n"
+            "Dùng /start hoặc /history để mở lại.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +529,7 @@ def _format_opportunity_summary(results: list[OpportunityResult]) -> str:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send welcome message with domain selection menu."""
+    await _cleanup_prev_ui(context, replace_type="menu")
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("\U0001F6D2 E-commerce", callback_data="domain:E-commerce"),
@@ -437,15 +551,19 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             InlineKeyboardButton("\U0001F4D6 Hướng dẫn", callback_data="help"),
             InlineKeyboardButton("\U0001F3C6 Top cơ hội", callback_data="top"),
         ],
+        [
+            InlineKeyboardButton("Đóng", callback_data="close"),
+        ],
     ])
 
-    await update.message.reply_text(
+    msg = await update.message.reply_text(
         "<b>SIGNAL RADAR</b>\n\n"
         "Phát hiện xu hướng trước 2-4 tuần khi demand bùng nổ.\n\n"
         "Chọn lĩnh vực muốn quét:",
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard,
     )
+    _remember_ui(context, msg, ui_type="menu")
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -581,6 +699,40 @@ async def handle_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     summary = _format_opportunity_summary(opportunities)
     await update.message.reply_text(summary, parse_mode=ParseMode.HTML)
 
+    # Persist scan results to history so /history works immediately
+    await register_user(update.effective_user.id)
+    for opp in opportunities:
+        wow = 999.0 if opp.wow_growth_pct == float("inf") else float(opp.wow_growth_pct)
+        await insert_scan_history(
+            keyword=opp.keyword,
+            chat_id=update.effective_user.id,
+            domain=opp.domain,
+            status=opp.status,
+            wow_growth=wow,
+            confidence=opp.confidence,
+            interest=opp.interest,
+            acceleration=opp.acceleration_pct,
+            consistency=opp.consistency_pct,
+            peak_position=opp.peak_position_pct,
+            action_label=opp.action_label,
+            action_reason=opp.action_reason,
+            geo=geo_code,
+            opportunity_score=opp.opportunity_score,
+            source_count=opp.source_count,
+            source_agreement=opp.source_agreement,
+            keyword_quality_label=opp.keyword_quality_label,
+            evidence_summary=opp.evidence_summary,
+            marketplace_presence_score=opp.marketplace_presence,
+            marketplace_intent_score=opp.marketplace_intent,
+            crowding_risk_score=opp.crowding_risk,
+            normalized_keyword=opp.normalized_keyword,
+            ambiguity_score=opp.resolution.ambiguity_score if opp.resolution else 0.0,
+            commercial_intent_score=opp.resolution.commercial_intent_score if opp.resolution else 0.0,
+            resolver_reason=opp.resolution.resolver_reason if opp.resolution else "",
+            dedup_minutes=5,
+        )
+    print(f"[SCAN] Saved {len(opportunities)} keywords to history for user {update.effective_user.id}")
+
     return ConversationHandler.END
 
 
@@ -600,28 +752,106 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data["selected_domain"] = domain if domain != "auto" else None
         context.user_data["awaiting_keywords"] = True
 
+        # Close the start menu after domain selection
+        await close_callback(query)
+
         domain_label = domain if domain != "auto" else "Tự phát hiện"
-        await query.message.reply_text(
-            f"\U0001F50D <b>Lĩnh vực: {domain_label}</b>\n\n"
-            "Nhập từ khóa cần quét, cách nhau bằng dấu phẩy.\n"
-            "Ví dụ: <i>mật ong, tinh bột nghệ, đường ăn kiêng</i>\n\n"
-            "Gửi /cancel để huỷ.",
+        msg = await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=(
+                f"\U0001F50D <b>Lĩnh vực: {domain_label}</b>\n\n"
+                "Nhập từ khóa cần quét, cách nhau bằng dấu phẩy.\n"
+                "Ví dụ: <i>mật ong, tinh bột nghệ, đường ăn kiêng</i>\n\n"
+                "Gửi /cancel để huỷ."
+            ),
             parse_mode=ParseMode.HTML,
         )
+        _remember_ui(context, msg)
+
+    elif query.data and query.data.startswith("hist:"):
+        # History picker callback — token-based
+        token = query.data.split(":", 1)[1]
+        payload = _cb_resolve(context, token)
+        if payload is None:
+            await _expired_callback(query)
+            return
+        keyword = payload["keyword"]
+        geo = payload["geo"]
+        # Close the picker
+        await close_callback(query)
+        # Run history lookup
+        rows = await get_keyword_history(update.effective_user.id, keyword, limit=10, geo=geo)
+        if not rows:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=(
+                    f"Chưa có lịch sử cho <b>{html.escape(keyword)}</b> [{geo}].\n"
+                    "Bot sẽ quét tự động khi từ khóa được theo dõi."
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        # Reuse history display logic
+        kw_escaped = html.escape(keyword)
+        lines = [f"<b>Lịch sử — {kw_escaped}</b> [{geo}] ({len(rows)} lần quét)\n"]
+        interests = [r["interest"] for r in reversed(rows)]
+        spark = _sparkline(interests)
+        if len(rows) >= 2:
+            trend_delta = compute_delta(rows[0], rows[-1])
+            if trend_delta:
+                lines.append(f"<b>Xu hướng tổng:</b> {trend_delta}\n")
+        for i, r in enumerate(rows):
+            status = r["status"]
+            emoji = STATUS_EMOJI.get(status, "\U0001F4CA")
+            wow = r["wow_growth"]
+            wow_str = f"{wow:+.1f}%" if wow else "—"
+            conf = r["confidence"]
+            interest = int(r["interest"])
+            date_str = r["scanned_at"][:10]
+            act_label = r.get("action_label") or ""
+            act_line = ""
+            if act_label:
+                act_emoji = ACTION_EMOJI.get(act_label, "")
+                act_vi = ACTION_LABEL_VI.get(act_label, "")
+                act_line = f" | {act_emoji} {act_vi}"
+            opp_score = r.get("opportunity_score") or 0
+            ms_line = f" | Opp: {opp_score:.0f}/100" if opp_score > 0 else ""
+            prev_row = rows[i + 1] if i + 1 < len(rows) else None
+            delta = compute_delta(r, prev_row)
+            delta_line = f"\n    ↪ {delta}" if delta else ""
+            lines.append(
+                f"{emoji} {date_str} | {status} | WoW: {wow_str} | "
+                f"Int: {interest} | Conf: {conf}{act_line}{ms_line}{delta_line}"
+            )
+        lines.append(f"\nInterest trend: <code>{spark}</code>")
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="\n".join(lines),
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif query.data == "close":
+        await close_callback(query)
+
     elif query.data == "help":
-        await query.message.reply_text(
-            "<b>Hướng dẫn sử dụng</b>\n\n"
-            "1. Nhấn /start → chọn lĩnh vực\n"
-            "2. Nhập từ khóa (cách nhau dấu phẩy)\n"
-            "3. Bot phân tích và trả kết quả\n\n"
-            "/track &lt;kw&gt; — Theo dõi tự động hàng ngày\n"
-            "/history &lt;kw&gt; — Xem lịch sử + xu hướng thay đổi\n"
-            "/mylist — Danh sách theo dõi + GO/WATCH/AVOID\n"
-            "/compare kw1, kw2 — So sánh cơ hội 2-5 từ khóa\n"
-            "/suggest &lt;kw&gt; — Gợi ý từ khóa liên quan\n"
-            "/top — Xem top cơ hội hiện tại\n"
-            "/start — Menu chính\n"
-            "/help — Xem hướng dẫn này",
+        await close_callback(query)
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=(
+                "<b>Hướng dẫn sử dụng</b>\n\n"
+                "1. Nhấn /start → chọn lĩnh vực\n"
+                "2. Nhập từ khóa (cách nhau dấu phẩy)\n"
+                "3. Bot phân tích và trả kết quả\n\n"
+                "/track &lt;kw&gt; — Theo dõi tự động hàng ngày\n"
+                "/history &lt;kw&gt; — Xem lịch sử + xu hướng thay đổi\n"
+                "/history — Chọn từ khóa từ danh sách theo dõi\n"
+                "/mylist — Danh sách theo dõi + GO/WATCH/AVOID\n"
+                "/compare kw1, kw2 — So sánh cơ hội 2-5 từ khóa\n"
+                "/suggest &lt;kw&gt; — Gợi ý từ khóa liên quan\n"
+                "/top — Xem top cơ hội hiện tại\n"
+                "/start — Menu chính\n"
+                "/help — Xem hướng dẫn này"
+            ),
             parse_mode=ParseMode.HTML,
         )
     elif query.data == "top":
@@ -646,9 +876,7 @@ async def resolve_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     res_data = context.user_data.get(res_key)
     if not res_data:
-        await query.message.reply_text(
-            "Dữ liệu gợi ý đã hết hạn. Dùng /scan để quét lại."
-        )
+        await _expired_callback(query)
         return
 
     original = res_data["original"]
@@ -781,6 +1009,7 @@ async def cmd_track(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from signal_radar import detect_domain
     domain = detect_domain(keyword)
     added = await add_keyword(update.effective_user.id, keyword, domain, geo=geo)
+    print(f"[TRACK] user={update.effective_user.id} kw={keyword!r} geo={geo} added={added}")
 
     geo_flag = GEO_FLAGS.get(geo, "\U0001F310")
     geo_label = GEO_LABELS.get(geo, geo)
@@ -1249,22 +1478,91 @@ def _sparkline(values: list[float]) -> str:
 
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show recent scan history for a tracked keyword with action labels + delta."""
+    chat_id = update.effective_user.id
+
+    # --- No args: show inline picker of tracked keywords ---
     if not context.args:
-        await update.message.reply_text(
-            "Dùng: <code>/history từ khóa</code>\nVí dụ: <code>/history mật ong</code>",
+        await _cleanup_prev_ui(context, replace_type="picker")
+        keywords = await get_user_keywords(chat_id)
+        if not keywords:
+            await update.message.reply_text(
+                "Danh sách theo dõi trống. Dùng /track để thêm từ khóa trước.",
+            )
+            return
+        buttons = []
+        for kw in keywords:
+            geo = kw.get("geo") or "VN"
+            geo_flag = GEO_FLAGS.get(geo, "\U0001F310")
+            token = _cb_token(context, {"keyword": kw["keyword"], "geo": geo})
+            buttons.append([InlineKeyboardButton(
+                f"{geo_flag} {kw['keyword']} [{geo}]",
+                callback_data=f"hist:{token}",
+            )])
+        buttons.append([InlineKeyboardButton("Đóng", callback_data="close")])
+        msg = await update.message.reply_text(
+            "<b>Lịch sử — Chọn từ khóa</b>",
             parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
         )
+        _remember_ui(context, msg, ui_type="picker")
         return
 
+    # --- With args: lookup history ---
     keyword = " ".join(context.args).strip()
-    rows = await get_keyword_history(update.effective_user.id, keyword, limit=10)
+
+    # Extract optional geo from last arg
+    geo = None
+    parts = keyword.rsplit(None, 1)
+    if len(parts) == 2 and parts[-1].upper() in ("VN", "US", "WW"):
+        geo = parts[-1].upper()
+        keyword = parts[0]
+
+    # Try exact match first
+    rows = await get_keyword_history(chat_id, keyword, limit=10, geo=geo)
+    print(f"[HISTORY] Exact lookup: user={chat_id} kw={keyword!r} geo={geo} rows={len(rows)}")
+
+    # Fallback: try normalized keyword match
+    if not rows:
+        from sources import normalize_keyword
+        norm_kw = normalize_keyword(keyword)
+        rows = await get_keyword_history_normalized(chat_id, norm_kw, limit=10, geo=geo)
+        print(f"[HISTORY] Normalized fallback: norm={norm_kw!r} rows={len(rows)}")
+
+    # Fallback: try matching against tracked keywords
+    if not rows:
+        from sources import normalize_keyword
+        tracked = await get_user_keywords(chat_id)
+        for tk in tracked:
+            if normalize_keyword(tk["keyword"]) == normalize_keyword(keyword):
+                rows = await get_keyword_history(
+                    chat_id, tk["keyword"], limit=10,
+                    geo=tk.get("geo"),
+                )
+                if rows:
+                    keyword = tk["keyword"]
+                    print(f"[HISTORY] Tracked fallback: matched={keyword!r} rows={len(rows)}")
+                    break
 
     if not rows:
-        await update.message.reply_text(
-            f"Chưa có lịch sử cho <b>{html.escape(keyword)}</b>.\n"
-            "Dùng /track để theo dõi từ khóa này trước.",
-            parse_mode=ParseMode.HTML,
+        # Clear error message explaining why
+        tracked = await get_user_keywords(chat_id)
+        tracked_names = [tk["keyword"] for tk in tracked]
+        is_tracked = any(
+            tk["keyword"].lower() == keyword.lower() for tk in tracked
         )
+        if is_tracked:
+            msg = (
+                f"Đã theo dõi <b>{html.escape(keyword)}</b> nhưng chưa có lịch sử quét.\n\n"
+                "Bot sẽ quét tự động vào đêm nay.\n"
+                "Hoặc dùng <code>/scan</code> để quét ngay."
+            )
+        else:
+            msg = (
+                f"Chưa có lịch sử cho <b>{html.escape(keyword)}</b>.\n\n"
+                "Dùng <code>/track {keyword}</code> để theo dõi\n"
+                "hoặc <code>/scan</code> để quét ngay."
+            )
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
         return
 
     kw_escaped = html.escape(keyword)
